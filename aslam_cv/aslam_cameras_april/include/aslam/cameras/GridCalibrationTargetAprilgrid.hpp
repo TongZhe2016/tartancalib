@@ -33,6 +33,8 @@ class GridCalibrationTargetAprilgrid : public GridCalibrationTargetBase {
       doSubpixRefinement(true),
       maxSubpixDisplacement2(1.5),
       showExtractionVideo(false),
+      saveExtractionImages(true),
+      extractionImagesOutputPath("./calibration_corners"),
       minTagsForValidObs(4),
       minBorderDistance(4.0),
       blackTagBorder(2) {};
@@ -46,6 +48,12 @@ class GridCalibrationTargetAprilgrid : public GridCalibrationTargetBase {
 
     /// \brief show video during extraction
     bool showExtractionVideo;
+
+    /// \brief save images with detected corners during extraction
+    bool saveExtractionImages;
+
+    /// \brief output path for saved extraction images
+    std::string extractionImagesOutputPath;
 
     /// \brief min. number of tags for a valid observation
     unsigned int minTagsForValidObs;
@@ -65,6 +73,8 @@ class GridCalibrationTargetAprilgrid : public GridCalibrationTargetBase {
        ar << BOOST_SERIALIZATION_NVP(doSubpixRefinement);
        ar << BOOST_SERIALIZATION_NVP(maxSubpixDisplacement2);
        ar << BOOST_SERIALIZATION_NVP(showExtractionVideo);
+       ar << BOOST_SERIALIZATION_NVP(saveExtractionImages);
+       ar << BOOST_SERIALIZATION_NVP(extractionImagesOutputPath);
        ar << BOOST_SERIALIZATION_NVP(minTagsForValidObs);
        ar << BOOST_SERIALIZATION_NVP(minBorderDistance);
        ar << BOOST_SERIALIZATION_NVP(blackTagBorder);
@@ -75,6 +85,8 @@ class GridCalibrationTargetAprilgrid : public GridCalibrationTargetBase {
        ar >> BOOST_SERIALIZATION_NVP(doSubpixRefinement);
        ar >> BOOST_SERIALIZATION_NVP(maxSubpixDisplacement2);
        ar >> BOOST_SERIALIZATION_NVP(showExtractionVideo);
+       ar >> BOOST_SERIALIZATION_NVP(saveExtractionImages);
+       ar >> BOOST_SERIALIZATION_NVP(extractionImagesOutputPath);
        ar >> BOOST_SERIALIZATION_NVP(minTagsForValidObs);
        ar >> BOOST_SERIALIZATION_NVP(minBorderDistance);
        ar >> BOOST_SERIALIZATION_NVP(blackTagBorder);

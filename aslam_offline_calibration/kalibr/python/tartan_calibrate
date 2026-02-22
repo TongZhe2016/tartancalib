@@ -134,6 +134,9 @@ def parseArgs():
     groupCalibrator.add_argument('--qr-tol', type=float, default=0.02, dest='qrTol', help='The tolerance on the factors of the QR decomposition (default: %(default)s)')
     groupCalibrator.add_argument('--mi-tol', type=float, default=0.2, dest='miTol', help='The tolerance on the mutual information for adding an image. Higher means fewer images will be added. Use -1 to force all images. (default: %(default)s)')
     groupCalibrator.add_argument('--no-shuffle', action='store_true', dest='noShuffle', help='Do not shuffle the dataset processing order')
+    groupCalibrator.add_argument('--weight-map-grid', type=int, default=0, dest='weightMapGrid', help='Grid cell size (px) for Jacobian-based weight map. 0=disabled. E.g. 15 builds a weight map that suppresses high-Jacobian (image edge) regions. (default: %(default)s)')
+    groupCalibrator.add_argument('--weight-map-power', type=float, default=2.0, dest='weightMapPower', help='Power for weight map: w = (median_jp / jp)^power. Higher = more aggressive suppression. (default: %(default)s)')
+    groupCalibrator.add_argument('--weight-map-cutoff', type=float, default=0.0, dest='weightMapCutoff', help='Hard cutoff: if jp_norm > cutoff * median_jp, set weight=0 (drop corner). 0=no cutoff. (default: %(default)s)')
 
     groupTartan = parser.add_argument_group("Tartan settings")
     groupTartan.add_argument('--fovs', type=int,dest='l_fov', nargs='+', action='append', help='If using pinhole projection mode, this parameter represents FOV of pinhole')
@@ -197,6 +200,213 @@ def parseArgs():
         parsed.dontShowReport = True
 
     return parsed
+
+def _binned_stat(uv, values, img_w, img_h, bins=40, stat='mean'):
+    """Bin scattered (u,v) data into a 2D grid, aggregating with `stat`."""
+    from scipy.stats import binned_statistic_2d
+    finite = np.isfinite(values)
+    if finite.sum() == 0:
+        return np.zeros((bins, bins)), np.linspace(0, img_w, bins+1), np.linspace(0, img_h, bins+1)
+    ret = binned_statistic_2d(
+        uv[finite, 0], uv[finite, 1], values[finite],
+        statistic=stat, bins=bins,
+        range=[[0, img_w], [0, img_h]])
+    H = ret.statistic.copy()
+    H[np.isnan(H)] = 0
+    return H, ret.x_edge, ret.y_edge
+
+
+def _save_corner_diagnostics(cam, cam_id, topic, observations,
+                              img_w, img_h, save_dir, bins=40):
+    """Generate corner density + gradient heatmaps and cache raw numpy data."""
+    from matplotlib.colors import LogNorm
+
+    all_corners = np.vstack([obs.getCornersImageFrame() for obs in observations])
+    per_frame_count = np.array([obs.getCornersImageFrame().shape[0] for obs in observations])
+
+    # --- Figure 1: Corner density (3 panels, same as before) ---
+    fig1, axes1 = pl.subplots(1, 3, figsize=(21, 6))
+    fig1.suptitle("cam{0} ({1}) — {2} corners from {3} frames".format(
+        cam_id, topic, len(all_corners), len(observations)), fontsize=13)
+
+    H_density, xedges, yedges = np.histogram2d(
+        all_corners[:, 0], all_corners[:, 1],
+        bins=[bins, bins], range=[[0, img_w], [0, img_h]])
+
+    ax = axes1[0]
+    im = ax.imshow(H_density.T, origin='upper', cmap='hot', interpolation='bilinear',
+                   extent=[0, img_w, img_h, 0], aspect='auto')
+    fig1.colorbar(im, ax=ax, label='count')
+    ax.set_xlabel('x (px)'); ax.set_ylabel('y (px)')
+    ax.set_title('Corner Density Heatmap')
+
+    ax = axes1[1]
+    ax.scatter(all_corners[:, 0], all_corners[:, 1], s=0.5, alpha=0.2, c='blue')
+    ax.set_xlim(0, img_w); ax.set_ylim(img_h, 0)
+    ax.set_xlabel('x (px)'); ax.set_ylabel('y (px)')
+    ax.set_title('All Detected Corners')
+    ax.set_aspect('equal')
+
+    ax = axes1[2]
+    ax.hist(per_frame_count, bins=30, color='steelblue', edgecolor='black')
+    ax.axvline(np.median(per_frame_count), color='red', linestyle='--',
+               label='median={:.0f}'.format(np.median(per_frame_count)))
+    ax.set_xlabel('Corners per frame'); ax.set_ylabel('Frame count')
+    ax.set_title('Corners-per-frame Distribution')
+    ax.legend()
+
+    pl.tight_layout()
+    p1 = os.path.join(save_dir, 'cam{0}_corner_heatmap.png'.format(cam_id))
+    fig1.savefig(p1, dpi=150); pl.close(fig1)
+    print("\tCorner heatmap saved to: {0}".format(p1))
+
+    # --- Collect raw cache dict ---
+    raw = {
+        "cam_id": cam_id,
+        "topic": topic,
+        "img_w": img_w,
+        "img_h": img_h,
+        "all_corners": all_corners,
+        "per_frame_count": per_frame_count,
+        "H_density": H_density,
+        "H_density_xedges": xedges,
+        "H_density_yedges": yedges,
+    }
+
+    # --- Figure 2: Per-stage gradient diagnostics ---
+    stages = getattr(cam, '_diag_per_stage', {})
+    for stage_name, diag in stages.items():
+        uv = diag["uv"]
+        reproj_err = diag["reproj_err"]
+        jp_norm = diag["jp_norm"]
+        grad_contrib = diag["grad_contrib"]
+
+        if len(uv) == 0:
+            continue
+
+        fig2, axes2 = pl.subplots(2, 2, figsize=(16, 12))
+        fig2.suptitle("cam{0} ({1}) — stage={2}  N={3}".format(
+            cam_id, topic, stage_name, len(uv)), fontsize=13)
+
+        finite_err = reproj_err[np.isfinite(reproj_err)]
+        finite_jp = jp_norm[np.isfinite(jp_norm)]
+        finite_gc = grad_contrib[np.isfinite(grad_contrib)]
+
+        # (0,0) Reprojection error scatter (log color)
+        ax = axes2[0, 0]
+        fe = np.abs(reproj_err).copy()
+        fe[~np.isfinite(fe)] = np.nan
+        fe_clip = np.clip(fe, 1e-3, None)
+        sc = ax.scatter(uv[:, 0], uv[:, 1], c=fe_clip, s=0.6, alpha=0.4,
+                        cmap='plasma', norm=LogNorm(vmin=max(np.nanpercentile(fe_clip, 1), 1e-2),
+                                                    vmax=np.nanpercentile(fe_clip, 99)))
+        fig2.colorbar(sc, ax=ax, label='|reproj err|')
+        ax.set_xlim(0, img_w); ax.set_ylim(img_h, 0)
+        ax.set_xlabel('x (px)'); ax.set_ylabel('y (px)')
+        ax.set_title('Reprojection Error (per corner)')
+        ax.set_aspect('equal')
+
+        # (0,1) Jacobian norm scatter (log color)
+        ax = axes2[0, 1]
+        jn = jp_norm.copy()
+        jn[~np.isfinite(jn)] = np.nan
+        jn_clip = np.clip(jn, 1e-3, None)
+        sc = ax.scatter(uv[:, 0], uv[:, 1], c=jn_clip, s=0.6, alpha=0.4,
+                        cmap='plasma', norm=LogNorm(vmin=max(np.nanpercentile(jn_clip, 1), 1e-2),
+                                                    vmax=np.nanpercentile(jn_clip, 99)))
+        fig2.colorbar(sc, ax=ax, label='||J_p||_F')
+        ax.set_xlim(0, img_w); ax.set_ylim(img_h, 0)
+        ax.set_xlabel('x (px)'); ax.set_ylabel('y (px)')
+        ax.set_title('Projection Jacobian Norm ||∂π/∂p||')
+        ax.set_aspect('equal')
+
+        # (1,0) Gradient contribution scatter (log color)
+        ax = axes2[1, 0]
+        gc = grad_contrib.copy()
+        gc[~np.isfinite(gc)] = np.nan
+        gc_clip = np.clip(gc, 1e-3, None)
+        sc = ax.scatter(uv[:, 0], uv[:, 1], c=gc_clip, s=0.6, alpha=0.4,
+                        cmap='plasma', norm=LogNorm(vmin=max(np.nanpercentile(gc_clip, 1), 1e-2),
+                                                    vmax=np.nanpercentile(gc_clip, 99)))
+        fig2.colorbar(sc, ax=ax, label='|err| · ||J||')
+        ax.set_xlim(0, img_w); ax.set_ylim(img_h, 0)
+        ax.set_xlabel('x (px)'); ax.set_ylabel('y (px)')
+        ax.set_title('Gradient Contribution |e|·||J||')
+        ax.set_aspect('equal')
+
+        # (1,1) Gradient contribution binned heatmap
+        ax = axes2[1, 1]
+        H_gc, xe, ye = _binned_stat(uv, grad_contrib, img_w, img_h, bins=bins, stat='mean')
+        H_gc_plot = H_gc.T.copy()
+        H_gc_plot[H_gc_plot <= 0] = np.nan
+        im = ax.imshow(H_gc_plot, origin='upper', cmap='inferno', interpolation='bilinear',
+                       extent=[0, img_w, img_h, 0], aspect='auto',
+                       norm=LogNorm(vmin=max(np.nanmin(H_gc_plot[H_gc_plot > 0]), 1e-2)
+                                    if np.any(H_gc_plot > 0) else 1e-2,
+                                    vmax=np.nanmax(H_gc_plot) if np.any(np.isfinite(H_gc_plot)) else 1))
+        fig2.colorbar(im, ax=ax, label='mean |e|·||J||')
+        ax.set_xlabel('x (px)'); ax.set_ylabel('y (px)')
+        ax.set_title('Gradient Contribution Heatmap (binned)')
+
+        pl.tight_layout()
+        p2 = os.path.join(save_dir, 'cam{0}_gradient_{1}.png'.format(cam_id, stage_name))
+        fig2.savefig(p2, dpi=150); pl.close(fig2)
+        print("\tGradient diagnostics ({0}) saved to: {1}".format(stage_name, p2))
+
+        # Binned heatmaps for error and Jacobian too
+        H_err, _, _ = _binned_stat(uv, np.abs(reproj_err), img_w, img_h, bins=bins, stat='mean')
+        H_jp, _, _ = _binned_stat(uv, jp_norm, img_w, img_h, bins=bins, stat='mean')
+
+        raw["diag_{0}_uv".format(stage_name)] = uv
+        raw["diag_{0}_reproj_err".format(stage_name)] = reproj_err
+        raw["diag_{0}_jp_norm".format(stage_name)] = jp_norm
+        raw["diag_{0}_grad_contrib".format(stage_name)] = grad_contrib
+        raw["diag_{0}_proj_params".format(stage_name)] = diag["proj_params"]
+        raw["diag_{0}_dist_params".format(stage_name)] = diag["dist_params"]
+        raw["diag_{0}_H_err".format(stage_name)] = H_err
+        raw["diag_{0}_H_jp".format(stage_name)] = H_jp
+        raw["diag_{0}_H_gc".format(stage_name)] = H_gc
+
+        # Weight map visualization (if present)
+        wmap = diag.get("weight_map", None)
+        per_corner_weight = diag.get("weight", None)
+        if wmap is not None:
+            fig_w, axes_w = pl.subplots(1, 2, figsize=(14, 5))
+            fig_w.suptitle("cam{0} ({1}) — Weight Map  stage={2}".format(
+                cam_id, topic, stage_name), fontsize=13)
+
+            ax = axes_w[0]
+            im = ax.imshow(wmap, origin='upper', cmap='RdYlGn', interpolation='nearest',
+                           extent=[0, img_w, img_h, 0], aspect='auto', vmin=0, vmax=1)
+            fig_w.colorbar(im, ax=ax, label='weight')
+            ax.set_xlabel('x (px)'); ax.set_ylabel('y (px)')
+            ax.set_title('Weight Map (grid={0}px)'.format(
+                diag.get("weight_map", np.array([])).shape))
+
+            ax = axes_w[1]
+            if per_corner_weight is not None and len(per_corner_weight) > 0:
+                sc = ax.scatter(uv[:, 0], uv[:, 1], c=per_corner_weight, s=0.6, alpha=0.4,
+                                cmap='RdYlGn', vmin=0, vmax=1)
+                fig_w.colorbar(sc, ax=ax, label='weight')
+            ax.set_xlim(0, img_w); ax.set_ylim(img_h, 0)
+            ax.set_xlabel('x (px)'); ax.set_ylabel('y (px)')
+            ax.set_title('Per-corner Weight')
+            ax.set_aspect('equal')
+
+            pl.tight_layout()
+            pw = os.path.join(save_dir, 'cam{0}_weightmap_{1}.png'.format(cam_id, stage_name))
+            fig_w.savefig(pw, dpi=150); pl.close(fig_w)
+            print("\tWeight map ({0}) saved to: {1}".format(stage_name, pw))
+
+            raw["diag_{0}_weight_map".format(stage_name)] = wmap
+        if per_corner_weight is not None:
+            raw["diag_{0}_weight".format(stage_name)] = per_corner_weight
+
+    # --- Save raw cache ---
+    npz_path = os.path.join(save_dir, 'cam{0}_diag_raw.npz'.format(cam_id))
+    np.savez_compressed(npz_path, **raw)
+    print("\tRaw diagnostic data saved to: {0}".format(npz_path))
+
 
 def main():
     parsed = parseArgs()
@@ -276,7 +486,9 @@ def main():
 
             #create camera
             cameraModel = cameraModels[modelName]
-            cam = kcc.CameraGeometry(cameraModel, targetConfig, dataset, verbose=(parsed.verbose or parsed.showextraction))
+            extraction_dir = os.path.join(parsed.saveDir, 'calibration_corners')
+            cam = kcc.CameraGeometry(cameraModel, targetConfig, dataset, verbose=(parsed.verbose or parsed.showextraction),
+                                     cam_id=cam_id, extraction_dir=extraction_dir)
 
             #extract the targets
             multithreading = not (parsed.verbose or parsed.showextraction)
@@ -288,8 +500,27 @@ def main():
                 obsdb.addObservation(cam_id, obs)
 
             obslist.append(observations)
+
+            img_w = int(observations[0].imCols())
+            img_h = int(observations[0].imRows())
+            print("\tImage resolution: {0} x {1}".format(img_w, img_h))
+
             #initialize the intrinsics
-            if not cam.initGeometryFromObservations(observations):
+            cam.weight_map_grid = parsed.weightMapGrid
+            cam.weight_map_power = parsed.weightMapPower
+            cam.weight_map_cutoff = parsed.weightMapCutoff
+            init_success = cam.initGeometryFromObservations(observations)
+
+            # Generate all diagnostics (corner density + gradient heatmaps + raw data)
+            try:
+                _save_corner_diagnostics(cam, cam_id, topic, observations,
+                                         img_w, img_h, parsed.saveDir)
+            except Exception as e:
+                import traceback
+                print("\t[WARN] Corner diagnostics generation failed: {0}".format(e))
+                traceback.print_exc()
+
+            if not init_success:
                 raise RuntimeError("Could not initialize the intrinsics for camera with topic: {0}. Try to use --verbose and check whether the calibration target extraction is successful.".format(topic))
 
             print("\tProjection initialized to: %s" % cam.geometry.projection().getParameters().flatten())

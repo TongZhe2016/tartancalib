@@ -4,10 +4,16 @@
 #include <opencv2/core/core.hpp>
 #include <opencv2/calib3d/calib3d.hpp>
 #include <opencv2/imgproc/imgproc.hpp>
+#include <opencv2/highgui/highgui.hpp>
 #include <boost/make_shared.hpp>
+#include <boost/filesystem.hpp>
 #include <sm/assert_macros.hpp>
 #include <sm/logging.hpp>
 #include <aslam/cameras/GridCalibrationTargetAprilgrid.hpp>
+#include <sstream>
+#include <iomanip>
+#include <sys/stat.h>
+#include <unistd.h>
 
 namespace aslam {
 namespace cameras {
@@ -266,6 +272,79 @@ bool GridCalibrationTargetAprilgrid::computeObservation(
     //if success is false exit here (delayed exit if _options.showExtractionVideo=true for debugging)
     if (!success)
       return success;
+  }
+
+  // Save extraction images if requested
+  if (_options.saveExtractionImages && detections.size() > 0) {
+    // Create output directory if it doesn't exist
+    boost::filesystem::path output_dir(_options.extractionImagesOutputPath);
+    if (!boost::filesystem::exists(output_dir)) {
+      boost::filesystem::create_directories(output_dir);
+      SM_INFO_STREAM("Created output directory: " << _options.extractionImagesOutputPath << "\n");
+    }
+
+    // Create visualization image
+    cv::Mat visualizationImage = image.clone();
+    cv::cvtColor(visualizationImage, visualizationImage, cv::COLOR_GRAY2RGB);
+    
+    // Draw detected tags and corners
+    for (unsigned i = 0; i < detections.size(); i++) {
+      // Draw tag outline
+      detections[i].draw(visualizationImage);
+      
+      // Draw refined corners
+      for (unsigned j = 0; j < 4; j++) {
+        cv::Point2f corner(tagCorners.at<float>(4 * i + j, 0),
+                          tagCorners.at<float>(4 * i + j, 1));
+        
+        // Draw a green circle for each corner
+        cv::circle(visualizationImage, corner, 5, CV_RGB(0, 255, 0), 2);
+        
+        // Draw corner index number
+        std::stringstream ss;
+        ss << (4 * i + j);
+        cv::putText(visualizationImage, ss.str(),
+                   cv::Point(corner.x + 8, corner.y + 8),
+                   cv::FONT_HERSHEY_SIMPLEX, 0.4,
+                   CV_RGB(255, 255, 0), 1, 8, false);
+      }
+      
+      // Draw tag ID
+      std::stringstream ss_id;
+      ss_id << "ID:" << detections[i].id;
+      cv::Point2f center((detections[i].p[0].first + detections[i].p[2].first) / 2.0,
+                        (detections[i].p[0].second + detections[i].p[2].second) / 2.0);
+      cv::putText(visualizationImage, ss_id.str(),
+                 cv::Point(center.x - 15, center.y),
+                 cv::FONT_HERSHEY_SIMPLEX, 0.6,
+                 CV_RGB(255, 0, 255), 2, 8, false);
+    }
+    
+    // Add status text
+    std::stringstream ss_status;
+    ss_status << "Detected " << detections.size() << " tags, " 
+              << (4 * detections.size()) << " corners";
+    cv::putText(visualizationImage, ss_status.str(),
+               cv::Point(10, 30), cv::FONT_HERSHEY_SIMPLEX, 0.7,
+               CV_RGB(0, 255, 255), 2, 8, false);
+    
+    if (!success) {
+      cv::putText(visualizationImage, "Detection failed! (frame not used)",
+                 cv::Point(10, 60), cv::FONT_HERSHEY_SIMPLEX, 0.7,
+                 CV_RGB(255, 0, 0), 2, 8, false);
+    }
+    
+    // Generate unique filename: use PID prefix so parallel worker processes
+    // (Python multiprocessing forks) each write to non-overlapping filenames.
+    static int frame_counter = 0;
+    std::stringstream filename;
+    filename << _options.extractionImagesOutputPath << "/corners_"
+             << std::setfill('0') << std::setw(6) << getpid() << "_"
+             << std::setw(6) << frame_counter++ << ".jpg";
+    
+    // Save the image
+    cv::imwrite(filename.str(), visualizationImage);
+    SM_DEBUG_STREAM("Saved corner visualization to: " << filename.str() << "\n");
   }
 
   //insert the observed points into the correct location of the grid point array

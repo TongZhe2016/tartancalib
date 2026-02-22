@@ -30,7 +30,7 @@ class OptimizationDiverged(Exception):
     pass
 
 class CameraGeometry(object):
-    def __init__(self, cameraModel, targetConfig, dataset, geometry=None, verbose=False):
+    def __init__(self, cameraModel, targetConfig, dataset, geometry=None, verbose=False, cam_id=None, extraction_dir=None):
         self.dataset = dataset
         
         self.model = cameraModel
@@ -46,7 +46,8 @@ class CameraGeometry(object):
         self.isGeometryInitialized = False
         
         #create target detector
-        self.ctarget = TargetDetector(targetConfig, self.geometry, showCorners=verbose, showReproj=verbose)
+        self.ctarget = TargetDetector(targetConfig, self.geometry, showCorners=verbose, showReproj=verbose,
+                                      cam_id=cam_id, extraction_dir=extraction_dir)
 
     def setDvActiveStatus(self, projectionActive, distortionActive, shutterActice):
         self.dv.projectionDesignVariable().setActive(projectionActive)
@@ -54,8 +55,26 @@ class CameraGeometry(object):
         self.dv.shutterDesignVariable().setActive(shutterActice)
 
     def initGeometryFromObservations(self, observations):
+        import numpy as np
+        import dill
+        def check_nan(stage):
+            proj = self.geometry.projection().getParameters().flatten()
+            dist = self.geometry.projection().distortion().getParameters().flatten()
+            print("[DEBUG] {} Proj: {} Dist: {}".format(stage, proj, dist))
+            if np.isnan(proj).any() or np.isnan(dist).any():
+                print("[FATAL ERROR] NaN detected at {}! Trying to save snapshot...".format(stage))
+                try:
+                    with open('/data/debug_vars.pkl', 'wb') as f:
+                        # Only save pure python data to avoid C++ binding pickling issues
+                        dill.dump({"observations_count": len(observations), "stage": stage}, f)
+                    print("[FATAL ERROR] Snapshot saved.")
+                except Exception as e:
+                    print("[FATAL ERROR] Could not save snapshot:", e)
+
+        check_nan("Start")
         #obtain focal length guess
         success = self.geometry.initializeIntrinsics(observations)
+        check_nan("After initializeIntrinsics")
         if not success:
             sm.logError("initialization of focal length for cam with topic {0} failed  ".format(self.dataset.topic))
         
@@ -63,11 +82,13 @@ class CameraGeometry(object):
         #(--> catch most of the distortion with the projection model)
         if self.model == acvb.DistortedOmni:
             success = kcc.calibrateIntrinsics(self, observations, distortionActive=False)
+            check_nan("After calibrateIntrinsics(distortionActive=False)")
             if not success:
                 sm.logError("initialization of intrinsics for cam with topic {0} failed  ".format(self.dataset.topic))
         
         #optimize for intrinsics & distortion    
         success = kcc.calibrateIntrinsics(self, observations)
+        check_nan("After calibrateIntrinsics(True)")
         if not success:
             sm.logError("initialization of intrinsics for cam with topic {0} failed  ".format(self.dataset.topic))
         
@@ -75,7 +96,7 @@ class CameraGeometry(object):
         return success
 
 class TargetDetector(object):
-    def __init__(self, targetConfig, cameraGeometry, showCorners=False, showReproj=False, showOneStep=False):
+    def __init__(self, targetConfig, cameraGeometry, showCorners=False, showReproj=False, showOneStep=False, cam_id=None, extraction_dir=None):
         self.targetConfig = targetConfig
         
         #initialize the calibration target
@@ -112,6 +133,13 @@ class TargetDetector(object):
             options.minTagsForValidObs = int( np.max( [targetParams['tagRows'], targetParams['tagCols']] ) + 1 )
             # options.minTagsForValidObs = 0
             options.showExtractionVideo = showCorners
+            
+            # Set per-camera extraction output directory
+            if cam_id is not None and extraction_dir is not None:
+                import os
+                cam_dir = os.path.join(extraction_dir, 'cam{0}'.format(cam_id))
+                os.makedirs(cam_dir, exist_ok=True)
+                options.extractionImagesOutputPath = cam_dir
             
             self.grid = acv_april.GridCalibrationTargetAprilgrid(targetParams['tagRows'], 
                                                                  targetParams['tagCols'], 
@@ -818,7 +846,423 @@ def plotOutlierCorners(cself, removedOutlierCorners, fno=1, clearFigure=True, ti
         resolution = (camera.geometry.projection().ru(), camera.geometry.projection().rv())
         I=np.zeros((resolution[1], resolution[0]))
         pl.imshow(I, cmap='Greys')
+
+
+def plotInlierHeatmap(cself, cam_id, fno=1, clearFigure=True, noShow=False, title="", bins=30):
+    """
+    Plot a 2D heatmap showing the spatial distribution of inlier corners
+    across the image plane. This helps visualize coverage and identify
+    areas with poor corner observations.
+    """
+    # Get all corners (inliers) from all views
+    all_corners, _, all_rerrs = getReprojectionErrors(cself, cam_id)
+    resolution = (cself.cameras[cam_id].geometry.projection().ru(), 
+                  cself.cameras[cam_id].geometry.projection().rv())
+    
+    # Collect all inlier corner positions
+    inlier_corners = []
+    for view_id, (corners, rerrs) in enumerate(zip(all_corners, all_rerrs)):
+        if corners is not None:
+            for corner, rerr in zip(corners, rerrs):
+                # Check if corner is valid (not None) and is an inlier
+                if not np.all(corner == np.array([None, None])):
+                    if not np.all(rerr == np.array([None, None])):
+                        # Consider inlier if reprojection error is reasonable
+                        error_magnitude = np.linalg.norm(rerr)
+                        if error_magnitude < 5.0:  # threshold in pixels
+                            inlier_corners.append(corner)
+    
+    if len(inlier_corners) == 0:
+        print("Warning: No inliers found for heatmap visualization")
+        return
+    
+    inlier_corners = np.array(inlier_corners)
+    
+    # Create figure
+    f = pl.figure(fno)
+    if clearFigure:
+        f.clf()
+    f.suptitle(title)
+    
+    # Create 2D histogram (heatmap)
+    pl.subplot(121)
+    H, xedges, yedges = np.histogram2d(inlier_corners[:, 0], inlier_corners[:, 1],
+                                        bins=[bins, bins],
+                                        range=[[0, resolution[0]], [0, resolution[1]]])
+    
+    # Plot heatmap
+    extent = [xedges[0], xedges[-1], yedges[-1], yedges[0]]
+    im = pl.imshow(H.T, extent=extent, origin='upper', cmap='hot', interpolation='bilinear', aspect='auto')
+    pl.colorbar(im, label='Corner Count')
+    pl.xlabel('Image X (pixels)')
+    pl.ylabel('Image Y (pixels)')
+    pl.title('Inlier Distribution Heatmap')
+    pl.grid(True, alpha=0.3)
+    
+    # Plot scatter overlay to show actual distribution
+    pl.subplot(122)
+    pl.hexbin(inlier_corners[:, 0], inlier_corners[:, 1], 
+              gridsize=bins, cmap='YlOrRd', mincnt=1)
+    pl.colorbar(label='Corner Density')
+    pl.xlabel('Image X (pixels)')
+    pl.ylabel('Image Y (pixels)')
+    pl.title('Inlier Hexbin Distribution')
+    pl.xlim([0, resolution[0]])
+    pl.ylim([resolution[1], 0])
+    pl.grid(True, alpha=0.3)
+    
+    # Add statistics text
+    coverage_score = len(inlier_corners) / (resolution[0] * resolution[1] / (bins * bins))
+    pl.text(0.02, 0.98, f'Total inliers: {len(inlier_corners)}\nCoverage score: {coverage_score:.4f}',
+            transform=pl.gca().transAxes, verticalalignment='top',
+            bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+    
+    if not noShow:
+        pl.show()
+
+
+def plotUVHessianWeightMap(cself, cam_id, fno=1, clearFigure=True, noShow=False, title="", bins=40):
+    """
+    Project per-corner Hessian contribution back to image uv coordinates.
+
+    For each valid reprojection error term, this function evaluates the local
+    Jacobian J and uses trace(J^T J) as a scalar "information strength".
+    The strength is accumulated into uv bins to reveal spatial imbalance of
+    front-end detections from an optimization-information perspective.
+    """
+    resolution = (cself.cameras[cam_id].geometry.projection().ru(),
+                  cself.cameras[cam_id].geometry.projection().rv())
+
+    uv_samples = []
+    hessian_strength_samples = []
+
+    # Collect per-corner Hessian contribution strength.
+    for view in cself.views:
+        if cam_id not in list(view.rerrs.keys()):
+            continue
+
+        for rerr in view.rerrs[cam_id]:
+            if rerr is None:
+                continue
+
+            try:
+                uv = np.array(rerr.getMeasurement(), dtype=np.float64).reshape(-1)
+                if uv.size < 2:
+                    continue
+
+                # Evaluate Jacobian of this error term and compute local information scalar.
+                jc = aopt.JacobianContainer(int(rerr.dimension()))
+                rerr.evaluateJacobians(jc)
+                J = jc.asDenseMatrix()
+
+                # Scalar Hessian contribution proxy: trace(J^T J) = ||J||_F^2.
+                strength = float(np.trace(J.T.dot(J)))
+
+                if np.isfinite(strength) and strength > 0.0:
+                    uv_samples.append([uv[0], uv[1]])
+                    hessian_strength_samples.append(strength)
+            except Exception:
+                # Skip terms that do not expose Jacobians in python bindings.
+                continue
+
+    if len(uv_samples) == 0:
+        print("Warning: No valid Jacobian/Hessian contribution samples for uv mapping")
+        return
+
+    uv_samples = np.array(uv_samples)
+    hessian_strength_samples = np.array(hessian_strength_samples)
+
+    # Weighted and count histograms in uv domain.
+    count_hist, xedges, yedges = np.histogram2d(
+        uv_samples[:, 0], uv_samples[:, 1],
+        bins=[bins, bins],
+        range=[[0, resolution[0]], [0, resolution[1]]]
+    )
+    weighted_hist, _, _ = np.histogram2d(
+        uv_samples[:, 0], uv_samples[:, 1],
+        bins=[bins, bins],
+        range=[[0, resolution[0]], [0, resolution[1]]],
+        weights=hessian_strength_samples
+    )
+
+    mean_hist = np.full_like(weighted_hist, np.nan)
+    valid = count_hist > 0
+    mean_hist[valid] = weighted_hist[valid] / count_hist[valid]
+
+    f = pl.figure(fno)
+    if clearFigure:
+        f.clf()
+    f.suptitle(title)
+
+    extent = [xedges[0], xedges[-1], yedges[-1], yedges[0]]
+
+    valid_sum_values = weighted_hist[valid]
+    if valid_sum_values.size == 0:
+        print("Warning: No valid uv bins for Hessian visualization")
+        return
+
+    sum_vmin = max(np.percentile(valid_sum_values, 5), 1e-15)
+    sum_vmax = max(np.percentile(valid_sum_values, 95), sum_vmin * 10.0)
+
+    valid_mean_values = mean_hist[valid]
+    mean_vmin = max(np.percentile(valid_mean_values, 5), 1e-15)
+    mean_vmax = max(np.percentile(valid_mean_values, 95), mean_vmin * 10.0)
+
+    sum_cmap = pl.cm.get_cmap('magma')
+    if hasattr(sum_cmap, 'copy'):
+        sum_cmap = sum_cmap.copy()
+    else:
+        # Compatibility fallback for older matplotlib versions.
+        sum_cmap = pl.cm.get_cmap('magma', 256)
+    sum_cmap.set_bad(color='black')
+
+    mean_cmap = pl.cm.get_cmap('viridis')
+    if hasattr(mean_cmap, 'copy'):
+        mean_cmap = mean_cmap.copy()
+    else:
+        # Compatibility fallback for older matplotlib versions.
+        mean_cmap = pl.cm.get_cmap('viridis', 256)
+    mean_cmap.set_bad(color='black')
+
+    # Left: total Hessian strength per uv bin (sum of local contributions).
+    pl.subplot(121)
+    sum_map = weighted_hist.T.astype(np.float64)
+    sum_map[sum_map <= 0.0] = np.nan
+    sum_masked = np.ma.masked_invalid(sum_map)
+    im1 = pl.imshow(
+        sum_masked,
+        extent=extent,
+        origin='upper',
+        cmap=sum_cmap,
+        interpolation='nearest',
+        aspect='auto',
+        norm=pl.matplotlib.colors.LogNorm(vmin=sum_vmin, vmax=sum_vmax)
+    )
+    pl.colorbar(im1, label='Summed Hessian Strength')
+    pl.xlabel('u (pixels)')
+    pl.ylabel('v (pixels)')
+    pl.title('UV Hessian Strength (sum per bin)')
+    pl.grid(True, alpha=0.2)
+
+    # Right: mean Hessian strength per corner in each uv bin.
+    pl.subplot(122)
+    mean_map = mean_hist.T.astype(np.float64)
+    mean_map[mean_map <= 0.0] = np.nan
+    mean_masked = np.ma.masked_invalid(mean_map)
+    im2 = pl.imshow(
+        mean_masked,
+        extent=extent,
+        origin='upper',
+        cmap=mean_cmap,
+        interpolation='nearest',
+        aspect='auto',
+        norm=pl.matplotlib.colors.LogNorm(vmin=mean_vmin, vmax=mean_vmax)
+    )
+    pl.colorbar(im2, label='Mean Hessian Strength / Corner')
+    pl.xlabel('u (pixels)')
+    pl.ylabel('v (pixels)')
+    pl.title('UV Hessian Strength (mean per corner)')
+    pl.grid(True, alpha=0.2)
+
+    # Summary diagnostics.
+    dense_mask = (count_hist >= 2) & valid
+    dense_values = weighted_hist[dense_mask] if np.any(dense_mask) else valid_sum_values
+    p10 = max(np.percentile(dense_values, 10), 1e-15)
+    p90 = max(np.percentile(dense_values, 90), p10)
+    imbalance = p90 / p10
+    txt = 'samples: {0}\nbins: {1}x{1}\nvalue range(p5-p95): {2:.2e}-{3:.2e}\nimbalance ratio(p90/p10): {4:.2e}'.format(
+        len(uv_samples), bins, sum_vmin, sum_vmax, imbalance)
+    pl.text(
+        0.02, 0.98, txt,
+        transform=pl.gca().transAxes,
+        verticalalignment='top',
+        bbox=dict(boxstyle='round', facecolor='white', alpha=0.75),
+        fontsize=9
+    )
+
+    if not noShow:
+        pl.show()
+
+
+def plotHessianVisualization(cself, fno=1, clearFigure=True, noShow=False, title=""):
+    """
+    Visualize the Hessian matrix structure from the optimization problem.
+    The Hessian represents the second-order derivative information and shows
+    parameter correlations and conditioning of the optimization problem.
+    """
+    try:
+        # Get the covariance matrix from the estimator
+        # Hessian ≈ Σ^(-1) for least squares problems
+        cov_matrix = cself.estimator.getSigma2Theta()
         
+        # Compute pseudo-inverse to get Hessian approximation
+        # Add small regularization to avoid numerical issues
+        reg_cov = cov_matrix + np.eye(cov_matrix.shape[0]) * 1e-10
+        hessian = np.linalg.pinv(reg_cov)
+        
+        # Create figure
+        f = pl.figure(fno)
+        if clearFigure:
+            f.clf()
+        f.suptitle(title)
+        
+        # Plot 1: Full Hessian matrix visualization
+        pl.subplot(221)
+        # Use log scale for better visualization of wide range of values
+        hessian_abs = np.abs(hessian)
+        hessian_abs[hessian_abs < 1e-15] = 1e-15  # Avoid log(0)
+        im1 = pl.imshow(hessian_abs, cmap='viridis', 
+                       norm=pl.matplotlib.colors.LogNorm(vmin=hessian_abs.min(), 
+                                                         vmax=hessian_abs.max()), 
+                       aspect='auto', interpolation='nearest')
+        pl.colorbar(im1, label='|H_ij| (log scale)')
+        pl.xlabel('Parameter Index')
+        pl.ylabel('Parameter Index')
+        pl.title('Hessian Matrix (log scale)')
+        pl.grid(True, alpha=0.2, linewidth=0.5)
+        
+        # Add parameter block boundaries if we can infer them
+        numCams = len(cself.cameras)
+        if numCams > 1:
+            baseline_params = 6 * (numCams - 1)
+            pl.axhline(y=baseline_params-0.5, color='r', linewidth=2, alpha=0.5)
+            pl.axvline(x=baseline_params-0.5, color='r', linewidth=2, alpha=0.5)
+        
+        # Plot 2: Hessian diagonal (parameter uncertainties/sensitivities)
+        pl.subplot(222)
+        diagonal = np.abs(np.diag(hessian))
+        diagonal[diagonal < 1e-15] = 1e-15  
+        pl.bar(range(len(diagonal)), diagonal, color='steelblue', alpha=0.7)
+        pl.xlabel('Parameter Index')
+        pl.ylabel('|H_ii| (sensitivity)')
+        pl.title('Hessian Diagonal')
+        pl.grid(True, alpha=0.3, axis='y')
+        pl.yscale('log')
+        
+        # Annotate parameter groups
+        if numCams > 1:
+            baseline_params = 6 * (numCams - 1)
+            pl.axvline(x=baseline_params-0.5, color='r', linewidth=2, alpha=0.5, linestyle='--')
+            pl.text(baseline_params/2, pl.ylim()[1]*0.9, 'Baselines', 
+                   ha='center', bbox=dict(boxstyle='round', facecolor='yellow', alpha=0.5))
+            pl.text(baseline_params + (len(diagonal)-baseline_params)/2, pl.ylim()[1]*0.9, 
+                   'Camera\nParams', ha='center', 
+                   bbox=dict(boxstyle='round', facecolor='cyan', alpha=0.5))
+        
+        # Plot 3: Eigenvalue spectrum
+        pl.subplot(223)
+        try:
+            eigenvalues, _ = np.linalg.eigh(hessian)
+            eigenvalues = np.abs(eigenvalues)
+            # Remove near-zero eigenvalues
+            eigenvalues = eigenvalues[eigenvalues > 1e-10]
+            eigenvalues_sorted = sorted(eigenvalues, reverse=True)
+            
+            pl.semilogy(eigenvalues_sorted, 'b.-', linewidth=2, markersize=6)
+            pl.xlabel('Eigenvalue Index')
+            pl.ylabel('Eigenvalue Magnitude')
+            pl.title('Eigenvalue Spectrum')
+            pl.grid(True, alpha=0.3)
+            
+            # Compute and display condition number
+            if len(eigenvalues) > 0:
+                cond_num = np.max(eigenvalues) / np.max([np.min(eigenvalues), 1e-15])
+                info_text = f'Condition number: {cond_num:.2e}\n'
+                info_text += f'Max eigenvalue: {np.max(eigenvalues):.2e}\n'
+                info_text += f'Min eigenvalue: {np.min(eigenvalues):.2e}\n'
+                info_text += f'Num. parameters: {len(diagonal)}'
+                pl.text(0.98, 0.98, info_text,
+                       transform=pl.gca().transAxes, 
+                       verticalalignment='top',
+                       horizontalalignment='right',
+                       bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8),
+                       fontsize=9)
+                
+                # Add interpretation
+                if cond_num > 1e10:
+                    status = "Poor (ill-conditioned)"
+                    color = 'red'
+                elif cond_num > 1e6:
+                    status = "Fair"
+                    color = 'orange'
+                else:
+                    status = "Good"
+                    color = 'green'
+                pl.text(0.02, 0.02, f'Conditioning: {status}',
+                       transform=pl.gca().transAxes,
+                       bbox=dict(boxstyle='round', facecolor=color, alpha=0.5),
+                       fontsize=10, weight='bold')
+        except Exception as e:
+            pl.text(0.5, 0.5, f'Eigenvalue analysis failed:\n{str(e)}',
+                   transform=pl.gca().transAxes, ha='center', va='center',
+                   bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
+        
+        # Plot 4: Correlation matrix
+        pl.subplot(224)
+        try:
+            # Compute correlation from Hessian: Corr = D^(-1) * H * D^(-1)
+            # where D is diagonal matrix of sqrt(diag(H))
+            diag_sqrt = np.sqrt(np.abs(np.diag(hessian)))
+            # Avoid division by zero
+            diag_sqrt[diag_sqrt < 1e-15] = 1e-15
+            D_inv = np.diag(1.0 / diag_sqrt)
+            correlation = D_inv @ hessian @ D_inv
+            
+            # Clamp values to [-1, 1] for numerical stability
+            correlation = np.clip(correlation, -1, 1)
+            
+            im4 = pl.imshow(correlation, cmap='RdBu_r', vmin=-1, vmax=1, 
+                          aspect='auto', interpolation='nearest')
+            pl.colorbar(im4, label='Correlation')
+            pl.xlabel('Parameter Index')
+            pl.ylabel('Parameter Index')
+            pl.title('Parameter Correlation Matrix')
+            pl.grid(True, alpha=0.2, linewidth=0.5)
+            
+            # Add parameter block boundaries
+            if numCams > 1:
+                baseline_params = 6 * (numCams - 1)
+                pl.axhline(y=baseline_params-0.5, color='yellow', linewidth=2, alpha=0.7)
+                pl.axvline(x=baseline_params-0.5, color='yellow', linewidth=2, alpha=0.7)
+            
+            # Show strong correlations
+            off_diag = correlation.copy()
+            np.fill_diagonal(off_diag, 0)
+            max_corr = np.max(np.abs(off_diag))
+            pl.text(0.02, 0.02, f'Max |correlation|: {max_corr:.3f}',
+                   transform=pl.gca().transAxes,
+                   bbox=dict(boxstyle='round', facecolor='white', alpha=0.8),
+                   fontsize=9)
+        except Exception as e:
+            pl.text(0.5, 0.5, f'Correlation computation failed:\n{str(e)}',
+                   transform=pl.gca().transAxes, ha='center', va='center',
+                   bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
+        
+        pl.tight_layout()
+        
+    except Exception as e:
+        print(f"Error in Hessian visualization: {e}")
+        import traceback
+        traceback.print_exc()
+        
+        # Create a simple error message plot
+        f = pl.figure(fno)
+        if clearFigure:
+            f.clf()
+        pl.text(0.5, 0.5, 
+               f'Hessian visualization failed:\n\n{str(e)}\n\n'
+               'Possible reasons:\n'
+               '- Optimization not converged\n'
+               '- Insufficient observations\n'
+               '- Numerical instability',
+               ha='center', va='center', fontsize=11,
+               bbox=dict(boxstyle='round', facecolor='lightcoral', alpha=0.7))
+        pl.axis('off')
+        f.suptitle(title)
+    
+    if not noShow:
+        pl.show()
+
 
 def generateReport(cself, filename="report.pdf", showOnScreen=True, graph=None, removedOutlierCorners=None):
     #plotter
@@ -858,6 +1302,27 @@ def generateReport(cself, filename="report.pdf", showOnScreen=True, graph=None, 
         plotAllReprojectionErrors(cself, cidx, fno=f.number, noShow=True, title=title)
         plotter.add_figure(title, f)
         figs.append(f)
+        
+        # NEW: Add inlier distribution heatmap
+        f = pl.figure(cidx*10+4)
+        title="cam{0}: inlier distribution heatmap".format(cidx)
+        plotInlierHeatmap(cself, cidx, fno=f.number, noShow=True, title=title)
+        plotter.add_figure(title, f)
+        figs.append(f)
+
+        # NEW: Add uv-mapped Hessian strength map for spatial imbalance diagnosis
+        f = pl.figure(cidx*10+5)
+        title="cam{0}: uv hessian strength map".format(cidx)
+        plotUVHessianWeightMap(cself, cidx, fno=f.number, noShow=True, title=title)
+        plotter.add_figure(title, f)
+        figs.append(f)
+    
+    # NEW: Add Hessian matrix visualization (once for all cameras)
+    f = pl.figure(2001)
+    title="Hessian Matrix Visualization"
+    plotHessianVisualization(cself, fno=f.number, noShow=True, title=title)
+    plotter.add_figure(title, f)
+    figs.append(f)
     
     #plot all removed outlier corners
     if removedOutlierCorners is not None:
