@@ -307,45 +307,39 @@ def calibrateIntrinsics(cam_geometry, obslist, distortionActive=True, intrinsics
             "corner_list": corner_list,
         })
 
-    # Build weight map
+    # Build weight map — spatial corner-count equalization
+    # Each grid cell's weight = median_count / cell_count
+    # Cells with more corners get lower per-corner weight, making spatial
+    # coverage uniform without suppressing the gradient magnitude itself.
     weight_map = None
-    if use_weight_map and len(all_jp_for_map) > 0:
+    if use_weight_map and len(all_uv_for_map) > 0:
         img_w = int(obslist[0].imCols())
         img_h = int(obslist[0].imRows())
         n_gx = (img_w + grid_size - 1) // grid_size
         n_gy = (img_h + grid_size - 1) // grid_size
 
-        wm_power = getattr(cam_geometry, 'weight_map_power', 2.0)
-        wm_cutoff = getattr(cam_geometry, 'weight_map_cutoff', 0.0)
-
-        gc_sum = np.zeros((n_gy, n_gx))
-        gc_cnt = np.zeros((n_gy, n_gx))
-
-        for uv, jpn, err in zip(all_uv_for_map, all_jp_for_map, all_err_for_map):
-            grad_c = abs(err) * jpn if (np.isfinite(err) and np.isfinite(jpn)) else np.nan
-            if not np.isfinite(grad_c):
-                continue
+        corner_cnt = np.zeros((n_gy, n_gx))
+        for uv in all_uv_for_map:
             gx = min(int(uv[0]) // grid_size, n_gx - 1)
             gy = min(int(uv[1]) // grid_size, n_gy - 1)
-            gc_sum[gy, gx] += grad_c
-            gc_cnt[gy, gx] += 1
+            corner_cnt[gy, gx] += 1
 
-        gc_mean = np.where(gc_cnt > 0, gc_sum / gc_cnt, 0.0)
-        gc_mean[gc_mean <= 0] = np.nan
+        occupied = corner_cnt > 0
+        mean_cnt = float(corner_cnt[occupied].mean())
 
-        med_gc = np.nanmedian(gc_mean)
-        weight_map = np.where(np.isfinite(gc_mean),
-                              np.clip((med_gc / gc_mean) ** wm_power, 0.0, 1.0),
+        # weight = mean_count / cell_count, clipped to [0, 1]
+        # dense cells (count > mean): weight < 1  → downweighted
+        # sparse cells (count <= mean): weight = 1  → full weight (not boosted beyond 1)
+        # cells with no corners default to 1.0 (irrelevant, no corners there)
+        weight_map = np.where(occupied,
+                              np.clip(mean_cnt / corner_cnt, 0.0, 1.0),
                               1.0)
-        if wm_cutoff > 0:
-            weight_map = np.where(np.isfinite(gc_mean) & (gc_mean > wm_cutoff * med_gc),
-                                  0.0, weight_map)
 
-        n_zero = int(np.sum(weight_map == 0))
-        wmin, wmax = np.nanmin(weight_map), np.nanmax(weight_map)
-        print(f"  [calibrateIntrinsics:{mode_label}] Weight map (|err|·||J||): grid={grid_size}px  "
-              f"power={wm_power}  cutoff={wm_cutoff}  median_gc={med_gc:.1f}  "
-              f"weight range=[{wmin:.8f}, {wmax:.4f}]  zero_cells={n_zero}")
+        n_occupied = int(np.sum(occupied))
+        wmin, wmax = float(weight_map[occupied].min()), float(weight_map[occupied].max())
+        print(f"  [calibrateIntrinsics:{mode_label}] Weight map (corner-count equalization): "
+              f"grid={grid_size}px  mean_count={mean_cnt:.1f}  "
+              f"occupied_cells={n_occupied}  weight range=[{wmin:.4f}, {wmax:.4f}]")
 
     ############################################
     ## Pass 2: add design variables and weighted error terms
@@ -415,6 +409,28 @@ def calibrateIntrinsics(cam_geometry, obslist, distortionActive=True, intrinsics
     diag_weight = np.array(diag_weight)
     diag_grad_contrib = np.abs(diag_err) * diag_jp_norm
 
+    # Collect per-frame camera pose data for visualization.
+    # T_t_c = pose of camera expressed in the target frame (T_{target <- camera}).
+    # T_t_c.t() gives the camera origin position in target coordinates.
+    _pose_t_list = []
+    _pose_rv_list = []
+    for _rec in obs_records:
+        _T_local = _rec["T_t_c"]
+        _T_mat_local = _T_local.T()
+        if not np.any(np.isnan(_T_mat_local)):
+            _pose_t_list.append(_T_local.t().flatten())
+            try:
+                from scipy.spatial.transform import Rotation as _ScipyR
+                _rvec = _ScipyR.from_matrix(_T_local.C()).as_rotvec()
+            except Exception:
+                _rvec = np.full(3, np.nan)
+            _pose_rv_list.append(_rvec)
+        else:
+            _pose_t_list.append(np.full(3, np.nan))
+            _pose_rv_list.append(np.full(3, np.nan))
+    _pose_translations = np.array(_pose_t_list) if _pose_t_list else np.empty((0, 3))
+    _pose_rotvecs = np.array(_pose_rv_list) if _pose_rv_list else np.empty((0, 3))
+
     if not hasattr(cam_geometry, '_diag_per_stage'):
         cam_geometry._diag_per_stage = {}
     cam_geometry._diag_per_stage[mode_label] = {
@@ -426,6 +442,8 @@ def calibrateIntrinsics(cam_geometry, obslist, distortionActive=True, intrinsics
         "weight_map": weight_map,
         "proj_params": p_init.copy(),
         "dist_params": d_init.copy(),
+        "pose_translations": _pose_translations,
+        "pose_rotations_rotvec": _pose_rotvecs,
     }
 
     if nan_transform_count > 0:

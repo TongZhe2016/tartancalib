@@ -134,9 +134,7 @@ def parseArgs():
     groupCalibrator.add_argument('--qr-tol', type=float, default=0.02, dest='qrTol', help='The tolerance on the factors of the QR decomposition (default: %(default)s)')
     groupCalibrator.add_argument('--mi-tol', type=float, default=0.2, dest='miTol', help='The tolerance on the mutual information for adding an image. Higher means fewer images will be added. Use -1 to force all images. (default: %(default)s)')
     groupCalibrator.add_argument('--no-shuffle', action='store_true', dest='noShuffle', help='Do not shuffle the dataset processing order')
-    groupCalibrator.add_argument('--weight-map-grid', type=int, default=0, dest='weightMapGrid', help='Grid cell size (px) for Jacobian-based weight map. 0=disabled. E.g. 15 builds a weight map that suppresses high-Jacobian (image edge) regions. (default: %(default)s)')
-    groupCalibrator.add_argument('--weight-map-power', type=float, default=2.0, dest='weightMapPower', help='Power for weight map: w = (median_jp / jp)^power. Higher = more aggressive suppression. (default: %(default)s)')
-    groupCalibrator.add_argument('--weight-map-cutoff', type=float, default=0.0, dest='weightMapCutoff', help='Hard cutoff: if jp_norm > cutoff * median_jp, set weight=0 (drop corner). 0=no cutoff. (default: %(default)s)')
+    groupCalibrator.add_argument('--weight-map-grid', type=int, default=0, dest='weightMapGrid', help='Grid cell size (px) for spatial corner-count equalization. 0=disabled. Each cell weight = median_count / cell_count, so dense regions get lower per-corner weight without suppressing gradient magnitude. E.g. 15. (default: %(default)s)')
 
     groupTartan = parser.add_argument_group("Tartan settings")
     groupTartan.add_argument('--fovs', type=int,dest='l_fov', nargs='+', action='append', help='If using pinhole projection mode, this parameter represents FOV of pinhole')
@@ -378,7 +376,7 @@ def _save_corner_diagnostics(cam, cam_id, topic, observations,
             ax = axes_w[0]
             im = ax.imshow(wmap, origin='upper', cmap='RdYlGn', interpolation='nearest',
                            extent=[0, img_w, img_h, 0], aspect='auto', vmin=0, vmax=1)
-            fig_w.colorbar(im, ax=ax, label='weight')
+            fig_w.colorbar(im, ax=ax, label='weight [0, 1]')
             ax.set_xlabel('x (px)'); ax.set_ylabel('y (px)')
             ax.set_title('Weight Map (grid={0}px)'.format(
                 diag.get("weight_map", np.array([])).shape))
@@ -387,7 +385,7 @@ def _save_corner_diagnostics(cam, cam_id, topic, observations,
             if per_corner_weight is not None and len(per_corner_weight) > 0:
                 sc = ax.scatter(uv[:, 0], uv[:, 1], c=per_corner_weight, s=0.6, alpha=0.4,
                                 cmap='RdYlGn', vmin=0, vmax=1)
-                fig_w.colorbar(sc, ax=ax, label='weight')
+                fig_w.colorbar(sc, ax=ax, label='weight [0, 1]')
             ax.set_xlim(0, img_w); ax.set_ylim(img_h, 0)
             ax.set_xlabel('x (px)'); ax.set_ylabel('y (px)')
             ax.set_title('Per-corner Weight')
@@ -401,6 +399,140 @@ def _save_corner_diagnostics(cam, cam_id, topic, observations,
             raw["diag_{0}_weight_map".format(stage_name)] = wmap
         if per_corner_weight is not None:
             raw["diag_{0}_weight".format(stage_name)] = per_corner_weight
+
+        # --- Camera pose visualization ---
+        pose_t_data = diag.get("pose_translations", None)
+        pose_rv_data = diag.get("pose_rotations_rotvec", None)
+        if pose_t_data is not None and len(pose_t_data) > 0:
+            valid_mask = np.isfinite(pose_t_data).all(axis=1)
+            pt_valid = pose_t_data[valid_mask]
+            if len(pt_valid) > 0:
+                try:
+                    import mpl_toolkits.mplot3d  # noqa: ensure 3d projection is registered
+                    fig_p = pl.figure(figsize=(18, 10))
+                    fig_p.suptitle(
+                        "cam{0} ({1}) — Init Camera Poses  stage={2}  N={3}/{4}".format(
+                            cam_id, topic, stage_name, len(pt_valid), len(pose_t_data)),
+                        fontsize=13)
+
+                    dists = np.linalg.norm(pt_valid, axis=1)
+
+                    # (1) 3-D scatter
+                    ax3d = fig_p.add_subplot(2, 3, 1, projection='3d')
+                    sc3d = ax3d.scatter(
+                        pt_valid[:, 0], pt_valid[:, 1], pt_valid[:, 2],
+                        c=dists, cmap='plasma', s=12, alpha=0.6)
+                    fig_p.colorbar(sc3d, ax=ax3d, label='dist (m)', shrink=0.55, pad=0.1)
+                    ax3d.scatter([0], [0], [0], c='red', s=80, marker='*',
+                                 zorder=5, label='Target origin')
+                    ax3d.set_xlabel('X (m)', labelpad=4)
+                    ax3d.set_ylabel('Y (m)', labelpad=4)
+                    ax3d.set_zlabel('Z (m)', labelpad=4)
+                    ax3d.set_title('3-D Camera Positions\n(target frame)')
+                    ax3d.legend(fontsize=7)
+
+                    # (2) Top view XY  (colored by Z)
+                    ax_xy = fig_p.add_subplot(2, 3, 2)
+                    sc_xy = ax_xy.scatter(
+                        pt_valid[:, 0], pt_valid[:, 1],
+                        c=pt_valid[:, 2], cmap='plasma', s=10, alpha=0.7)
+                    fig_p.colorbar(sc_xy, ax=ax_xy, label='Z (m)')
+                    ax_xy.scatter([0], [0], c='red', s=60, marker='*', zorder=5)
+                    ax_xy.set_xlabel('X (m)'); ax_xy.set_ylabel('Y (m)')
+                    ax_xy.set_title('Top View (XY plane)')
+                    ax_xy.set_aspect('equal'); ax_xy.grid(True, alpha=0.3)
+
+                    # (3) Side view XZ  (colored by Y)
+                    ax_xz = fig_p.add_subplot(2, 3, 3)
+                    sc_xz = ax_xz.scatter(
+                        pt_valid[:, 0], pt_valid[:, 2],
+                        c=pt_valid[:, 1], cmap='viridis', s=10, alpha=0.7)
+                    fig_p.colorbar(sc_xz, ax=ax_xz, label='Y (m)')
+                    ax_xz.scatter([0], [0], c='red', s=60, marker='*', zorder=5)
+                    ax_xz.set_xlabel('X (m)'); ax_xz.set_ylabel('Z (m)')
+                    ax_xz.set_title('Side View (XZ plane)')
+                    ax_xz.set_aspect('equal'); ax_xz.grid(True, alpha=0.3)
+
+                    # (4) Distance histogram
+                    ax_dist = fig_p.add_subplot(2, 3, 4)
+                    ax_dist.hist(dists, bins=30, color='steelblue', edgecolor='black')
+                    ax_dist.axvline(np.median(dists), color='red', linestyle='--',
+                                    label='median={:.3f} m'.format(np.median(dists)))
+                    ax_dist.axvline(np.mean(dists), color='orange', linestyle=':',
+                                    label='mean={:.3f} m'.format(np.mean(dists)))
+                    ax_dist.set_xlabel('Distance (m)'); ax_dist.set_ylabel('Frame count')
+                    ax_dist.set_title('Camera-to-Target Distance Distribution')
+                    ax_dist.legend(fontsize=8); ax_dist.grid(True, alpha=0.3)
+
+                    # (5) Rotation angle histogram
+                    ax_rot = fig_p.add_subplot(2, 3, 5)
+                    if pose_rv_data is not None:
+                        rv_valid = pose_rv_data[valid_mask]
+                        if rv_valid.shape[0] > 0 and not np.all(np.isnan(rv_valid)):
+                            rot_angles_deg = np.rad2deg(
+                                np.linalg.norm(rv_valid, axis=1))
+                            rot_angles_deg = rot_angles_deg[np.isfinite(rot_angles_deg)]
+                            ax_rot.hist(rot_angles_deg, bins=30,
+                                        color='darkorange', edgecolor='black')
+                            ax_rot.axvline(np.median(rot_angles_deg), color='red',
+                                           linestyle='--',
+                                           label='median={:.1f}°'.format(
+                                               np.median(rot_angles_deg)))
+                            ax_rot.set_xlabel('Rotation angle (deg)')
+                            ax_rot.set_ylabel('Frame count')
+                            ax_rot.set_title('Camera Rotation Angle Distribution')
+                            ax_rot.legend(fontsize=8); ax_rot.grid(True, alpha=0.3)
+
+                    # (6) Stats text
+                    ax_txt = fig_p.add_subplot(2, 3, 6)
+                    ax_txt.axis('off')
+                    stats_txt = (
+                        "Pose Statistics  [{stage}]\n\n"
+                        "Valid poses : {nv} / {nt}\n\n"
+                        "X : [{xmin:.3f},  {xmax:.3f}] m   σ={xstd:.3f}\n"
+                        "Y : [{ymin:.3f},  {ymax:.3f}] m   σ={ystd:.3f}\n"
+                        "Z : [{zmin:.3f},  {zmax:.3f}] m   σ={zstd:.3f}\n\n"
+                        "Distance:\n"
+                        "  min    = {dmin:.3f} m\n"
+                        "  max    = {dmax:.3f} m\n"
+                        "  median = {dmed:.3f} m\n"
+                        "  mean   = {dmean:.3f} m\n"
+                        "  std    = {dstd:.3f} m"
+                    ).format(
+                        stage=stage_name,
+                        nv=len(pt_valid), nt=len(pose_t_data),
+                        xmin=pt_valid[:,0].min(), xmax=pt_valid[:,0].max(),
+                        xstd=pt_valid[:,0].std(),
+                        ymin=pt_valid[:,1].min(), ymax=pt_valid[:,1].max(),
+                        ystd=pt_valid[:,1].std(),
+                        zmin=pt_valid[:,2].min(), zmax=pt_valid[:,2].max(),
+                        zstd=pt_valid[:,2].std(),
+                        dmin=dists.min(), dmax=dists.max(),
+                        dmed=float(np.median(dists)),
+                        dmean=dists.mean(), dstd=dists.std(),
+                    )
+                    ax_txt.text(0.05, 0.95, stats_txt,
+                                transform=ax_txt.transAxes, fontsize=9,
+                                verticalalignment='top', fontfamily='monospace',
+                                bbox=dict(boxstyle='round', facecolor='wheat',
+                                          alpha=0.5))
+
+                    pl.tight_layout()
+                    pp = os.path.join(
+                        save_dir,
+                        'cam{0}_poses_{1}.png'.format(cam_id, stage_name))
+                    fig_p.savefig(pp, dpi=150); pl.close(fig_p)
+                    print("\tPose visualization ({0}) saved to: {1}".format(
+                        stage_name, pp))
+
+                    raw["diag_{0}_pose_translations".format(stage_name)] = pose_t_data
+                    if pose_rv_data is not None:
+                        raw["diag_{0}_pose_rotvecs".format(stage_name)] = pose_rv_data
+
+                except Exception as _pe:
+                    import traceback
+                    print("\t[WARN] Pose visualization failed: {0}".format(_pe))
+                    traceback.print_exc()
 
     # --- Save raw cache ---
     npz_path = os.path.join(save_dir, 'cam{0}_diag_raw.npz'.format(cam_id))
@@ -507,8 +639,6 @@ def main():
 
             #initialize the intrinsics
             cam.weight_map_grid = parsed.weightMapGrid
-            cam.weight_map_power = parsed.weightMapPower
-            cam.weight_map_cutoff = parsed.weightMapCutoff
             init_success = cam.initGeometryFromObservations(observations)
 
             # Generate all diagnostics (corner density + gradient heatmaps + raw data)
