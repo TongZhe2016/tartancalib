@@ -1264,6 +1264,288 @@ def plotHessianVisualization(cself, fno=1, clearFigure=True, noShow=False, title
         pl.show()
 
 
+def plotBestWorstFrameAnalysis(cself, cam_id, fno_best=4000, fno_worst=4001,
+                                clearFigure=True, noShow=False):
+    """
+    Find the best frame (minimum mean reprojection error) and worst frame
+    (maximum mean reprojection error) for cam_id.
+
+    For each frame produce a 4-panel figure:
+      1. Camera image overlaid with detected corners (green) and
+         reprojection predictions (red x).
+      2. XY scatter of per-corner reprojection errors for that frame.
+      3. Per-frame UV Hessian Strength heatmap (only corners in this frame).
+      4. Text summary: frame pose (T_target_cam), camera intrinsics,
+         and basic statistics.
+
+    Returns a list of (figure, title_string) tuples for the best and worst
+    frames, suitable for adding directly to a PlotCollection / PDF.
+    """
+    resolution = (cself.cameras[cam_id].geometry.projection().ru(),
+                  cself.cameras[cam_id].geometry.projection().rv())
+
+    # ------------------------------------------------------------------
+    # Step 1: Compute per-view mean reprojection error magnitude
+    # ------------------------------------------------------------------
+    view_mean_errs = []  # list of (view_idx, mean_err_px, num_corners)
+    for view_idx, view in enumerate(cself.views):
+        if cam_id not in view.rerrs:
+            continue
+        errs = []
+        for rerr in view.rerrs[cam_id]:
+            if rerr is not None:
+                c = rerr.getMeasurement()
+                r = rerr.getPredictedMeasurement()
+                errs.append(np.linalg.norm(np.array(c) - np.array(r)))
+        if len(errs) > 0:
+            view_mean_errs.append((view_idx, float(np.mean(errs)), len(errs)))
+
+    if len(view_mean_errs) == 0:
+        print("Warning: No valid reprojection errors for cam {0} — "
+              "skipping best/worst frame analysis.".format(cam_id))
+        return []
+
+    view_mean_errs.sort(key=lambda x: x[1])
+    best_view_idx,  best_mean_err,  _ = view_mean_errs[0]
+    worst_view_idx, worst_mean_err, _ = view_mean_errs[-1]
+
+    # ------------------------------------------------------------------
+    # Step 2: Helper – collect all per-corner data for one view
+    # ------------------------------------------------------------------
+    def _get_frame_data(view_idx):
+        view = cself.views[view_idx]
+        cams_in_view = [t[0] for t in view.rig_observations]
+        if cam_id not in cams_in_view:
+            return None
+        obs = view.rig_observations[cams_in_view.index(cam_id)][1]
+
+        corners, reproj_pts, xy_errs = [], [], []
+        uv_samples, hess_strengths = [], []
+
+        for rerr in view.rerrs[cam_id]:
+            if rerr is None:
+                continue
+            c = np.array(rerr.getMeasurement(), dtype=np.float64)
+            r = np.array(rerr.getPredictedMeasurement(), dtype=np.float64)
+            corners.append(c)
+            reproj_pts.append(r)
+            xy_errs.append(c - r)
+            # Per-corner Hessian contribution: trace(J^T J)
+            try:
+                jc = aopt.JacobianContainer(int(rerr.dimension()))
+                rerr.evaluateJacobians(jc)
+                J = jc.asDenseMatrix()
+                strength = float(np.trace(J.T.dot(J)))
+                if np.isfinite(strength) and strength > 0.0:
+                    uv_samples.append([c[0], c[1]])
+                    hess_strengths.append(strength)
+            except Exception:
+                pass  # skip if Jacobians are not accessible
+
+        # Frame pose
+        T_mat = None
+        try:
+            T_mat = np.array(view.dv_T_target_camera.T())
+        except Exception:
+            pass
+
+        return {
+            'obs':           obs,
+            'corners':       np.array(corners)       if corners       else np.zeros((0, 2)),
+            'reproj_pts':    np.array(reproj_pts)    if reproj_pts    else np.zeros((0, 2)),
+            'xy_errs':       np.array(xy_errs)       if xy_errs       else np.zeros((0, 2)),
+            'uv_samples':    np.array(uv_samples)    if uv_samples    else np.zeros((0, 2)),
+            'hess_strengths':np.array(hess_strengths) if hess_strengths else np.zeros(0),
+            'T_mat':         T_mat,
+        }
+
+    # ------------------------------------------------------------------
+    # Step 3: Render a single-frame analysis figure
+    # ------------------------------------------------------------------
+    def _render_frame_figure(view_idx, mean_err, label, fno):
+        data = _get_frame_data(view_idx)
+        if data is None:
+            return None
+
+        obs           = data['obs']
+        corners       = data['corners']
+        reproj_pts    = data['reproj_pts']
+        xy_errs       = data['xy_errs']
+        uv_samples    = data['uv_samples']
+        hess_strengths= data['hess_strengths']
+        T_mat         = data['T_mat']
+
+        f = pl.figure(fno, figsize=(16, 12))
+        if clearFigure:
+            f.clf()
+        f.suptitle(
+            'cam{0}: {1} frame  (view index {2})\n'
+            'Mean reprojection error: {3:.4f} px  |  Detected corners: {4}'.format(
+                cam_id, label, view_idx, mean_err, len(corners)),
+            fontsize=11)
+
+        # ---- Panel 1: image + corners + reprojections ----
+        ax1 = f.add_subplot(2, 2, 1)
+        try:
+            I = obs.getImage()
+            if I is not None and I.ndim >= 2 and I.shape[0] > 0 and I.shape[1] > 0:
+                ax1.imshow(I, cmap='gray', aspect='auto')
+        except Exception:
+            pass
+        if len(corners) > 0:
+            ax1.plot(corners[:, 0], corners[:, 1],
+                     'go', markersize=5, alpha=0.85, label='Detected corners')
+            ax1.plot(reproj_pts[:, 0], reproj_pts[:, 1],
+                     'rx', markersize=7, markeredgewidth=2, alpha=0.9, label='Reprojections')
+        ax1.set_xlim([0, resolution[0]])
+        ax1.set_ylim([resolution[1], 0])
+        ax1.set_title('Corner detection & reprojections')
+        ax1.legend(fontsize=8, loc='upper right')
+        ax1.set_xlabel('u (pixels)')
+        ax1.set_ylabel('v (pixels)')
+
+        # ---- Panel 2: XY reprojection error scatter ----
+        ax2 = f.add_subplot(2, 2, 2)
+        if len(xy_errs) > 0:
+            ax2.scatter(xy_errs[:, 0], xy_errs[:, 1],
+                        c='steelblue', alpha=0.8, s=25, zorder=3)
+            ax2.axhline(0, color='k', linewidth=0.6, zorder=2)
+            ax2.axvline(0, color='k', linewidth=0.6, zorder=2)
+            ax2.axis('equal')
+            ax2.grid(True, alpha=0.4)
+            mean_ex = float(np.mean(xy_errs[:, 0]))
+            mean_ey = float(np.mean(xy_errs[:, 1]))
+            std_ex  = float(np.std(xy_errs[:, 0]))
+            std_ey  = float(np.std(xy_errs[:, 1]))
+            ax2.set_title(
+                'XY Reprojection Errors\n'
+                'mean=({0:.3f}, {1:.3f}) px   std=({2:.3f}, {3:.3f}) px'.format(
+                    mean_ex, mean_ey, std_ex, std_ey),
+                fontsize=9)
+        else:
+            ax2.text(0.5, 0.5, 'No data', ha='center', va='center',
+                     transform=ax2.transAxes)
+            ax2.set_title('XY Reprojection Errors')
+        ax2.set_xlabel('error x (pix)')
+        ax2.set_ylabel('error y (pix)')
+
+        # ---- Panel 3: per-frame UV Hessian Strength heatmap ----
+        ax3 = f.add_subplot(2, 2, 3)
+        ax3.set_facecolor('black')
+        if len(uv_samples) > 0:
+            bins = 20
+            weighted_hist, xedges, yedges = np.histogram2d(
+                uv_samples[:, 0], uv_samples[:, 1],
+                bins=[bins, bins],
+                range=[[0, resolution[0]], [0, resolution[1]]],
+                weights=hess_strengths)
+            extent = [xedges[0], xedges[-1], yedges[-1], yedges[0]]
+            wmap = weighted_hist.T.astype(np.float64)
+            wmap[wmap <= 0.0] = np.nan
+            wmap_masked = np.ma.masked_invalid(wmap)
+            valid_vals = wmap_masked.compressed()
+            if len(valid_vals) > 0:
+                vmin = max(float(np.percentile(valid_vals, 5)),  1e-15)
+                vmax = max(float(np.percentile(valid_vals, 95)), vmin * 10.0)
+                cmap_h = pl.cm.get_cmap('magma')
+                if hasattr(cmap_h, 'copy'):
+                    cmap_h = cmap_h.copy()
+                cmap_h.set_bad(color='black')
+                im3 = ax3.imshow(
+                    wmap_masked, extent=extent, origin='upper',
+                    cmap=cmap_h, interpolation='nearest', aspect='auto',
+                    norm=pl.matplotlib.colors.LogNorm(vmin=vmin, vmax=vmax))
+                pl.colorbar(im3, ax=ax3, label='Summed Hessian Strength')
+            # Overlay corner positions
+            ax3.scatter(uv_samples[:, 0], uv_samples[:, 1],
+                        c='cyan', s=12, alpha=0.7, zorder=5)
+            ax3.text(0.02, 0.98,
+                     'corners: {0}  hess-max: {1:.2e}'.format(
+                         len(uv_samples), float(np.max(hess_strengths))),
+                     transform=ax3.transAxes, va='top', fontsize=8,
+                     color='white',
+                     bbox=dict(boxstyle='round', facecolor='black', alpha=0.5))
+        else:
+            ax3.text(0.5, 0.5, 'No Jacobian data available',
+                     ha='center', va='center', transform=ax3.transAxes,
+                     color='white')
+        ax3.set_xlim([0, resolution[0]])
+        ax3.set_ylim([resolution[1], 0])
+        ax3.set_xlabel('u (pixels)')
+        ax3.set_ylabel('v (pixels)')
+        ax3.set_title('Per-frame UV Hessian Strength')
+
+        # ---- Panel 4: text – pose + camera intrinsics ----
+        ax4 = f.add_subplot(2, 2, 4)
+        ax4.axis('off')
+        lines = ['=== Frame Summary ===',
+                 'View index   : {0}'.format(view_idx),
+                 'Quality      : {0}'.format(label),
+                 'Mean repr err: {0:.4f} px'.format(mean_err),
+                 'Corners      : {0}'.format(len(corners)),
+                 '']
+
+        if T_mat is not None:
+            try:
+                T = np.array(T_mat)
+                t = T[:3, 3]
+                R = T[:3, :3]
+                lines.append('=== Pose  T_target_cam ===')
+                lines.append('t = [{0:.4f},  {1:.4f},  {2:.4f}]'.format(
+                    t[0], t[1], t[2]))
+                lines.append('R = [{0:.4f},  {1:.4f},  {2:.4f}]'.format(
+                    R[0, 0], R[0, 1], R[0, 2]))
+                lines.append('    [{0:.4f},  {1:.4f},  {2:.4f}]'.format(
+                    R[1, 0], R[1, 1], R[1, 2]))
+                lines.append('    [{0:.4f},  {1:.4f},  {2:.4f}]'.format(
+                    R[2, 0], R[2, 1], R[2, 2]))
+                lines.append('')
+            except Exception as e:
+                lines.append('Pose: not available ({0})'.format(e))
+                lines.append('')
+
+        try:
+            cam  = cself.cameras[cam_id]
+            d    = cam.geometry.projection().distortion().getParameters().flatten()
+            p    = cam.geometry.projection().getParameters().flatten()
+            lines.append('=== Camera Intrinsics ===')
+            lines.append('Projection  : {0}'.format(
+                np.array2string(p, precision=4, separator=', ')))
+            lines.append('Distortion  : {0}'.format(
+                np.array2string(d, precision=6, separator=', ')))
+        except Exception as e:
+            lines.append('Intrinsics: not available ({0})'.format(e))
+
+        ax4.text(0.02, 0.98, '\n'.join(lines),
+                 transform=ax4.transAxes, verticalalignment='top',
+                 fontsize=8, family='monospace',
+                 bbox=dict(boxstyle='round', facecolor='lightyellow', alpha=0.7))
+
+        pl.tight_layout(rect=[0, 0, 1, 0.90])
+        return f
+
+    # ------------------------------------------------------------------
+    # Step 4: Build figures for best and worst frames
+    # ------------------------------------------------------------------
+    results = []
+    f_best = _render_frame_figure(
+        best_view_idx,  best_mean_err,
+        'BEST  (min reprojection error)', fno_best)
+    if f_best is not None:
+        results.append((f_best, 'cam{0}: best frame analysis'.format(cam_id)))
+
+    f_worst = _render_frame_figure(
+        worst_view_idx, worst_mean_err,
+        'WORST (max reprojection error)', fno_worst)
+    if f_worst is not None:
+        results.append((f_worst, 'cam{0}: worst frame analysis'.format(cam_id)))
+
+    if not noShow:
+        pl.show()
+
+    return results
+
+
 def generateReport(cself, filename="report.pdf", showOnScreen=True, graph=None, removedOutlierCorners=None):
     #plotter
     plotter = PlotCollection.PlotCollection("Calibration report")
@@ -1316,7 +1598,18 @@ def generateReport(cself, filename="report.pdf", showOnScreen=True, graph=None, 
         plotUVHessianWeightMap(cself, cidx, fno=f.number, noShow=True, title=title)
         plotter.add_figure(title, f)
         figs.append(f)
-    
+
+        # NEW: Best and worst frame analysis (per-frame corners, reprojection
+        #      XY scatter, UV Hessian strength, pose + intrinsics text panel)
+        bw_results = plotBestWorstFrameAnalysis(
+            cself, cidx,
+            fno_best=4000 + cidx * 10,
+            fno_worst=4000 + cidx * 10 + 1,
+            noShow=True)
+        for f_bw, title_bw in bw_results:
+            plotter.add_figure(title_bw, f_bw)
+            figs.append(f_bw)
+
     # NEW: Add Hessian matrix visualization (once for all cameras)
     f = pl.figure(2001)
     title="Hessian Matrix Visualization"
