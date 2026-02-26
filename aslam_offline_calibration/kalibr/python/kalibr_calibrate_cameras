@@ -104,6 +104,16 @@ def parseArgs():
     outlierSettings.add_argument('--use-blakezisserman', action='store_true', dest='doBlakeZisserman', help='Enable the Blake-Zisserman m-estimator')
     outlierSettings.add_argument('--plot-outliers', action='store_true', dest='doPlotOutliers', help='Plot the detect outliers during extraction (this could be slow)')
     
+    fisheyeSettings = parser.add_argument_group('FisheyeDetector injection (optional)')
+    fisheyeSettings.add_argument('--precomputed-detections', dest='precomputedDetections',
+                                  default=None, metavar='FILE.npz',
+                                  help='Path to .npz produced by extract_fisheye_detections.py. '
+                                       'Bypasses the C++ AprilTag detector with FisheyeDetector results.')
+    fisheyeSettings.add_argument('--fisheye-conf-thr', dest='fisheyeConfThr', type=float, default=0.5,
+                                  help='FisheyeDetector corner confidence threshold (default: %(default)s)')
+    fisheyeSettings.add_argument('--fisheye-min-corners', dest='fisheyeMinCorners', type=int, default=4,
+                                  help='Minimum accepted corners per frame (default: %(default)s)')
+
     outputSettings = parser.add_argument_group('Output options')
     outputSettings.add_argument('--verbose', action='store_true', dest='verbose', help='Enable (really) verbose output (disables plots)')
     outputSettings.add_argument('--show-extraction', action='store_true', dest='showextraction', help='Show the calibration target extraction. (disables plots)')
@@ -174,9 +184,12 @@ def main():
                 
             #extract the targets
             multithreading = not (parsed.verbose or parsed.showextraction)
-            observations = kc.extractCornersFromDataset(cam.dataset, cam.ctarget.detector, 
+            observations = kc.extractCornersFromDataset(cam.dataset, cam.ctarget.detector,
                                                         multithreading=multithreading, clearImages=False,
-                                                        noTransformation=True)
+                                                        noTransformation=True,
+                                                        precomputed_detections_file=parsed.precomputedDetections,
+                                                        conf_thr=parsed.fisheyeConfThr,
+                                                        min_corners=parsed.fisheyeMinCorners)
             
             #populate the database
             for obs in observations:

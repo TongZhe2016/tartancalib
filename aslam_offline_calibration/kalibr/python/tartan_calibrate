@@ -134,7 +134,9 @@ def parseArgs():
     groupCalibrator.add_argument('--qr-tol', type=float, default=0.02, dest='qrTol', help='The tolerance on the factors of the QR decomposition (default: %(default)s)')
     groupCalibrator.add_argument('--mi-tol', type=float, default=0.2, dest='miTol', help='The tolerance on the mutual information for adding an image. Higher means fewer images will be added. Use -1 to force all images. (default: %(default)s)')
     groupCalibrator.add_argument('--no-shuffle', action='store_true', dest='noShuffle', help='Do not shuffle the dataset processing order')
-    groupCalibrator.add_argument('--weight-map-grid', type=int, default=0, dest='weightMapGrid', help='Grid cell size (px) for spatial corner-count equalization. 0=disabled. Each cell weight = median_count / cell_count, so dense regions get lower per-corner weight without suppressing gradient magnitude. E.g. 15. (default: %(default)s)')
+    groupCalibrator.add_argument('--weight-map-grid', type=int, default=0, dest='weightMapGrid', help='Grid cell size (px) for gradient-contribution weight map. 0=disabled. E.g. 15 builds a weight map that suppresses high-gradient (image edge) corners. (default: %(default)s)')
+    groupCalibrator.add_argument('--weight-map-power', type=float, default=2.0, dest='weightMapPower', help='Power for weight map: w = (median_gc / gc_cell)^power. Higher = more aggressive suppression. (default: %(default)s)')
+    groupCalibrator.add_argument('--weight-map-cutoff', type=float, default=0.0, dest='weightMapCutoff', help='Hard cutoff: if gc_cell > cutoff * median_gc, set weight=0 (drop corners in that cell). 0=no cutoff. (default: %(default)s)')
 
     groupTartan = parser.add_argument_group("Tartan settings")
     groupTartan.add_argument('--fovs', type=int,dest='l_fov', nargs='+', action='append', help='If using pinhole projection mode, this parameter represents FOV of pinhole')
@@ -158,6 +160,16 @@ def parseArgs():
     outlierSettings.add_argument('--min-views-outlier', type=int, default=20, dest='minViewOutlier', help='Number of raw views to initialize statistics (default: %(default)s)')
     outlierSettings.add_argument('--use-blakezisserman', action='store_true', dest='doBlakeZisserman', help='Enable the Blake-Zisserman m-estimator')
     outlierSettings.add_argument('--plot-outliers', action='store_true', dest='doPlotOutliers', help='Plot the detect outliers during extraction (this could be slow)')
+
+    fisheyeSettings = parser.add_argument_group('FisheyeDetector injection (optional)')
+    fisheyeSettings.add_argument('--precomputed-detections', dest='precomputedDetections',
+                                  default=None, metavar='FILE.npz',
+                                  help='Path to .npz produced by extract_fisheye_detections.py. '
+                                       'Bypasses the C++ AprilTag detector with FisheyeDetector results.')
+    fisheyeSettings.add_argument('--fisheye-conf-thr', dest='fisheyeConfThr', type=float, default=0.5,
+                                  help='FisheyeDetector corner confidence threshold (default: %(default)s)')
+    fisheyeSettings.add_argument('--fisheye-min-corners', dest='fisheyeMinCorners', type=int, default=4,
+                                  help='Minimum accepted corners per frame (default: %(default)s)')
 
     outputSettings = parser.add_argument_group('Output options')
     outputSettings.add_argument('--verbose', action='store_true', dest='verbose', help='Enable (really) verbose output (disables plots)')
@@ -626,7 +638,10 @@ def main():
             multithreading = not (parsed.verbose or parsed.showextraction)
             observations = kc.extractCornersFromDataset(cam.dataset, cam.ctarget.detector,
                                                         multithreading=multithreading, clearImages=False,
-                                                        noTransformation=True)
+                                                        noTransformation=True,
+                                                        precomputed_detections_file=parsed.precomputedDetections,
+                                                        conf_thr=parsed.fisheyeConfThr,
+                                                        min_corners=parsed.fisheyeMinCorners)
             #populate the database
             for obs in observations:
                 obsdb.addObservation(cam_id, obs)
@@ -638,7 +653,9 @@ def main():
             print("\tImage resolution: {0} x {1}".format(img_w, img_h))
 
             #initialize the intrinsics
-            cam.weight_map_grid = parsed.weightMapGrid
+            cam.weight_map_grid    = parsed.weightMapGrid
+            cam.weight_map_power   = parsed.weightMapPower
+            cam.weight_map_cutoff  = parsed.weightMapCutoff
             init_success = cam.initGeometryFromObservations(observations)
 
             # Generate all diagnostics (corner density + gradient heatmaps + raw data)

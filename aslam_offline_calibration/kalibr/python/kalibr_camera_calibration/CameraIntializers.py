@@ -259,6 +259,8 @@ def calibrateIntrinsics(cam_geometry, obslist, distortionActive=True, intrinsics
 
     grid_size = getattr(cam_geometry, 'weight_map_grid', 0)
     use_weight_map = grid_size > 0
+    weight_map_power  = getattr(cam_geometry, 'weight_map_power',  2.0)
+    weight_map_cutoff = getattr(cam_geometry, 'weight_map_cutoff', 0.0)
     
     sm.logDebug("calibrateIntrinsics: adding camera error terms for {0} calibration targets".format(len(obslist)))
     nan_transform_count = 0
@@ -307,10 +309,11 @@ def calibrateIntrinsics(cam_geometry, obslist, distortionActive=True, intrinsics
             "corner_list": corner_list,
         })
 
-    # Build weight map — spatial corner-count equalization
-    # Each grid cell's weight = median_count / cell_count
-    # Cells with more corners get lower per-corner weight, making spatial
-    # coverage uniform without suppressing the gradient magnitude itself.
+    # Build weight map — gradient-contribution squared regularisation
+    # g_i = |e_i| * ||J_i||  (gradient contribution of each corner)
+    # Per-cell mean: gc_cell = mean(g_i)   Reference: median_gc over all cells
+    # weight = min(1, (median_gc / gc_cell)^power)
+    # Optional hard cutoff: gc_cell > cutoff * median_gc  →  weight = 0
     weight_map = None
     if use_weight_map and len(all_uv_for_map) > 0:
         img_w = int(obslist[0].imCols())
@@ -318,28 +321,39 @@ def calibrateIntrinsics(cam_geometry, obslist, distortionActive=True, intrinsics
         n_gx = (img_w + grid_size - 1) // grid_size
         n_gy = (img_h + grid_size - 1) // grid_size
 
-        corner_cnt = np.zeros((n_gy, n_gx))
-        for uv in all_uv_for_map:
+        gc_sum = np.zeros((n_gy, n_gx))
+        gc_cnt = np.zeros((n_gy, n_gx))
+        for uv, jp, err in zip(all_uv_for_map, all_jp_for_map, all_err_for_map):
+            gc = float(np.abs(err) * jp) if (np.isfinite(jp) and np.isfinite(err)) else float('nan')
+            if not np.isfinite(gc):
+                continue
             gx = min(int(uv[0]) // grid_size, n_gx - 1)
             gy = min(int(uv[1]) // grid_size, n_gy - 1)
-            corner_cnt[gy, gx] += 1
+            gc_sum[gy, gx] += gc
+            gc_cnt[gy, gx] += 1
 
-        occupied = corner_cnt > 0
-        mean_cnt = float(corner_cnt[occupied].mean())
+        occupied = gc_cnt > 0
+        gc_mean_map = np.where(occupied, gc_sum / np.where(occupied, gc_cnt, 1.0), np.nan)
 
-        # weight = mean_count / cell_count, clipped to [0, 1]
-        # dense cells (count > mean): weight < 1  → downweighted
-        # sparse cells (count <= mean): weight = 1  → full weight (not boosted beyond 1)
-        # cells with no corners default to 1.0 (irrelevant, no corners there)
-        weight_map = np.where(occupied,
-                              np.clip(mean_cnt / corner_cnt, 0.0, 1.0),
-                              1.0)
+        median_gc = float(np.nanmedian(gc_mean_map[occupied]))
+        if median_gc <= 0 or not np.isfinite(median_gc):
+            median_gc = 1.0
+
+        # w = min(1, (median_gc / gc_cell)^power);  cutoff → 0 if gc_cell > cutoff*median
+        with np.errstate(invalid='ignore', divide='ignore'):
+            ratio = np.where(occupied, median_gc / gc_mean_map, 1.0)
+        w_raw = np.where(occupied, np.clip(ratio ** weight_map_power, 0.0, 1.0), 1.0)
+        if weight_map_cutoff > 0:
+            w_raw = np.where(occupied & (gc_mean_map > weight_map_cutoff * median_gc),
+                             0.0, w_raw)
+        weight_map = w_raw
 
         n_occupied = int(np.sum(occupied))
         wmin, wmax = float(weight_map[occupied].min()), float(weight_map[occupied].max())
-        print(f"  [calibrateIntrinsics:{mode_label}] Weight map (corner-count equalization): "
-              f"grid={grid_size}px  mean_count={mean_cnt:.1f}  "
-              f"occupied_cells={n_occupied}  weight range=[{wmin:.4f}, {wmax:.4f}]")
+        print(f"  [calibrateIntrinsics:{mode_label}] Weight map (grad-contrib^2): "
+              f"grid={grid_size}px  power={weight_map_power}  cutoff={weight_map_cutoff}  "
+              f"median_gc={median_gc:.2f}  occupied_cells={n_occupied}  "
+              f"weight range=[{wmin:.4f}, {wmax:.4f}]")
 
     ############################################
     ## Pass 2: add design variables and weighted error terms
