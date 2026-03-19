@@ -17,6 +17,8 @@ import pylab as pl
 import math
 import gc
 import sys
+import os
+import re
 
 from enum import Enum
 np.set_printoptions(suppress=True, precision=8)
@@ -967,6 +969,9 @@ def plotUVHessianWeightMap(cself, cam_id, fno=1, clearFigure=True, noShow=False,
 
     if len(uv_samples) == 0:
         print("Warning: No valid Jacobian/Hessian contribution samples for uv mapping")
+        plotUVReprojectionErrorMap(
+            cself, cam_id, fno=fno, clearFigure=clearFigure, noShow=noShow,
+            title=(title + " (fallback: reprojection error map)").strip(), bins=bins)
         return
 
     uv_samples = np.array(uv_samples)
@@ -999,6 +1004,9 @@ def plotUVHessianWeightMap(cself, cam_id, fno=1, clearFigure=True, noShow=False,
     valid_sum_values = weighted_hist[valid]
     if valid_sum_values.size == 0:
         print("Warning: No valid uv bins for Hessian visualization")
+        plotUVReprojectionErrorMap(
+            cself, cam_id, fno=fno, clearFigure=clearFigure, noShow=noShow,
+            title=(title + " (fallback: reprojection error map)").strip(), bins=bins)
         return
 
     sum_vmin = max(np.percentile(valid_sum_values, 5), 1e-15)
@@ -1082,6 +1090,115 @@ def plotUVHessianWeightMap(cself, cam_id, fno=1, clearFigure=True, noShow=False,
 
     if not noShow:
         pl.show()
+
+
+def plotUVReprojectionErrorMap(cself, cam_id, fno=1, clearFigure=True, noShow=False, title="", bins=40):
+    """
+    Show spatial distribution of reprojection error magnitudes across the image.
+    This is used directly in reports and also as a fallback when Hessian/Jacobian
+    samples are unavailable.
+    """
+    resolution = (cself.cameras[cam_id].geometry.projection().ru(),
+                  cself.cameras[cam_id].geometry.projection().rv())
+
+    uv_samples = []
+    reproj_mag = []
+
+    for view in cself.views:
+        if cam_id not in list(view.rerrs.keys()):
+            continue
+
+        for rerr in view.rerrs[cam_id]:
+            if rerr is None:
+                continue
+            try:
+                c = np.array(rerr.getMeasurement(), dtype=np.float64).reshape(-1)
+                p = np.array(rerr.getPredictedMeasurement(), dtype=np.float64).reshape(-1)
+                if c.size < 2 or p.size < 2:
+                    continue
+                err = np.linalg.norm(c[:2] - p[:2])
+                if np.isfinite(err):
+                    uv_samples.append([c[0], c[1]])
+                    reproj_mag.append(err)
+            except Exception:
+                continue
+
+    f = pl.figure(fno)
+    if clearFigure:
+        f.clf()
+    f.suptitle(title)
+
+    if len(uv_samples) == 0:
+        pl.text(
+            0.5, 0.5,
+            'No valid reprojection samples available',
+            ha='center', va='center', fontsize=11,
+            bbox=dict(boxstyle='round', facecolor='lightcoral', alpha=0.7))
+        pl.axis('off')
+        if not noShow:
+            pl.show()
+        return
+
+    uv_samples = np.array(uv_samples)
+    reproj_mag = np.array(reproj_mag)
+
+    mean_hist, xedges, yedges = np.histogram2d(
+        uv_samples[:, 0], uv_samples[:, 1],
+        bins=[bins, bins],
+        range=[[0, resolution[0]], [0, resolution[1]]],
+        weights=reproj_mag
+    )
+    count_hist, _, _ = np.histogram2d(
+        uv_samples[:, 0], uv_samples[:, 1],
+        bins=[bins, bins],
+        range=[[0, resolution[0]], [0, resolution[1]]]
+    )
+
+    valid = count_hist > 0
+    mean_map = np.full_like(mean_hist, np.nan, dtype=np.float64)
+    mean_map[valid] = mean_hist[valid] / count_hist[valid]
+
+    pl.subplot(121)
+    mean_plot = mean_map.T
+    im1 = pl.imshow(
+        np.ma.masked_invalid(mean_plot),
+        extent=[xedges[0], xedges[-1], yedges[-1], yedges[0]],
+        origin='upper',
+        cmap='plasma',
+        interpolation='nearest',
+        aspect='auto')
+    pl.colorbar(im1, label='Mean |reprojection error| (px)')
+    pl.xlabel('u (pixels)')
+    pl.ylabel('v (pixels)')
+    pl.title('UV Reprojection Error (mean per bin)')
+    pl.grid(True, alpha=0.2)
+
+    pl.subplot(122)
+    sc = pl.scatter(
+        uv_samples[:, 0], uv_samples[:, 1],
+        c=np.clip(reproj_mag, 0.0, np.percentile(reproj_mag, 99)),
+        s=1.2, alpha=0.35, cmap='plasma')
+    pl.colorbar(sc, label='|reprojection error| (px)')
+    pl.xlim([0, resolution[0]])
+    pl.ylim([resolution[1], 0])
+    pl.xlabel('u (pixels)')
+    pl.ylabel('v (pixels)')
+    pl.title(
+        'Per-corner reprojection error\n'
+        'N={0}, median={1:.4f}px, p95={2:.4f}px'.format(
+            len(reproj_mag),
+            float(np.median(reproj_mag)),
+            float(np.percentile(reproj_mag, 95))))
+    pl.grid(True, alpha=0.2)
+
+    pl.tight_layout()
+    if not noShow:
+        pl.show()
+
+
+def _slugify_report_title(title):
+    slug = re.sub(r'[^A-Za-z0-9]+', '_', title.strip().lower()).strip('_')
+    return slug or 'figure'
 
 
 def plotHessianVisualization(cself, fno=1, clearFigure=True, noShow=False, title=""):
@@ -1550,7 +1667,8 @@ def generateReport(cself, filename="report.pdf", showOnScreen=True, graph=None, 
     #plotter
     plotter = PlotCollection.PlotCollection("Calibration report")
 
-    figs = list()    
+    figs = list()
+    fig_titles = list()
     #plot graph
     if graph is not None:
         f=pl.figure(1001)
@@ -1558,6 +1676,7 @@ def generateReport(cself, filename="report.pdf", showOnScreen=True, graph=None, 
         graph.plotGraphPylab(fno=f.number, noShow=True, title=title)
         plotter.add_figure("Obs. graph", f)
         figs.append(f)
+        fig_titles.append(title)
         
     #rig geometry
     if len(cself.cameras)>1:
@@ -1566,6 +1685,7 @@ def generateReport(cself, filename="report.pdf", showOnScreen=True, graph=None, 
         plotCameraRig(cself.baselines, fno=f.number, clearFigure=False, title=title)
         plotter.add_figure(title, f)
         figs.append(f)
+        fig_titles.append(title)
         
     #plot for each camera
     for cidx, cam in enumerate(cself.cameras):
@@ -1574,16 +1694,26 @@ def generateReport(cself, filename="report.pdf", showOnScreen=True, graph=None, 
         plotPolarError(cself, cidx, fno=f.number, noShow=True, title=title)
         plotter.add_figure(title, f)
         figs.append(f)
+        fig_titles.append(title)
         f = pl.figure(cidx*10+2)
         title="cam{0}: azimuthal error".format(cidx)
         plotAzumithalError(cself, cidx, fno=f.number, noShow=True, title=title)
         plotter.add_figure(title, f)
         figs.append(f)
+        fig_titles.append(title)
         f = pl.figure(cidx*10+3)
         title="cam{0}: reprojection errors".format(cidx)
         plotAllReprojectionErrors(cself, cidx, fno=f.number, noShow=True, title=title)
         plotter.add_figure(title, f)
         figs.append(f)
+        fig_titles.append(title)
+
+        f = pl.figure(cidx*10+31)
+        title="cam{0}: uv reprojection error map".format(cidx)
+        plotUVReprojectionErrorMap(cself, cidx, fno=f.number, noShow=True, title=title)
+        plotter.add_figure(title, f)
+        figs.append(f)
+        fig_titles.append(title)
         
         # NEW: Add inlier distribution heatmap
         f = pl.figure(cidx*10+4)
@@ -1591,6 +1721,7 @@ def generateReport(cself, filename="report.pdf", showOnScreen=True, graph=None, 
         plotInlierHeatmap(cself, cidx, fno=f.number, noShow=True, title=title)
         plotter.add_figure(title, f)
         figs.append(f)
+        fig_titles.append(title)
 
         # NEW: Add uv-mapped Hessian strength map for spatial imbalance diagnosis
         f = pl.figure(cidx*10+5)
@@ -1598,6 +1729,7 @@ def generateReport(cself, filename="report.pdf", showOnScreen=True, graph=None, 
         plotUVHessianWeightMap(cself, cidx, fno=f.number, noShow=True, title=title)
         plotter.add_figure(title, f)
         figs.append(f)
+        fig_titles.append(title)
 
         # NEW: Best and worst frame analysis (per-frame corners, reprojection
         #      XY scatter, UV Hessian strength, pose + intrinsics text panel)
@@ -1609,6 +1741,7 @@ def generateReport(cself, filename="report.pdf", showOnScreen=True, graph=None, 
         for f_bw, title_bw in bw_results:
             plotter.add_figure(title_bw, f_bw)
             figs.append(f_bw)
+            fig_titles.append(title_bw)
 
     # NEW: Add Hessian matrix visualization (once for all cameras)
     f = pl.figure(2001)
@@ -1616,6 +1749,7 @@ def generateReport(cself, filename="report.pdf", showOnScreen=True, graph=None, 
     plotHessianVisualization(cself, fno=f.number, noShow=True, title=title)
     plotter.add_figure(title, f)
     figs.append(f)
+    fig_titles.append(title)
     
     #plot all removed outlier corners
     if removedOutlierCorners is not None:
@@ -1625,12 +1759,21 @@ def generateReport(cself, filename="report.pdf", showOnScreen=True, graph=None, 
             plotOutlierCorners(cself, removedOutlierCorners, fno=f.number, title=title)
             plotter.add_figure("Outlier corners", f)
             figs.append(f)
+            fig_titles.append(title)
             
     #save to pdf
     pdf=PdfPages(filename)
     for fig in figs:
         pdf.savefig(fig)
     pdf.close()
+
+    report_base = os.path.splitext(filename)[0]
+    for fig, title in zip(figs, fig_titles):
+        try:
+            png_path = "{0}__{1}.png".format(report_base, _slugify_report_title(title))
+            fig.savefig(png_path, dpi=150)
+        except Exception as e:
+            print("Warning: Failed to export report figure PNG '{0}': {1}".format(title, e))
     print("Report written to: {0}".format(filename))
     
     if showOnScreen:

@@ -12,6 +12,186 @@ def addPoseDesignVariable(problem, T0=sm.Transformation()):
     problem.addDesignVariable(t_Dv)
     return aopt.TransformationBasicDv( q_Dv.toExpression(), t_Dv.toExpression() )
 
+
+def collectStageDiagnostics(cam_geometry, obslist, mode_label="final"):
+    """
+    Collect per-corner / per-pose diagnostics for the current geometry without
+    running another optimization. This is used for workflows that load an
+    existing camchain and therefore skip the normal intrinsics-init stages.
+    """
+    if obslist is None or len(obslist) == 0:
+        return False
+
+    d_init = cam_geometry.geometry.projection().distortion().getParameters().flatten()
+    p_init = cam_geometry.geometry.projection().getParameters().flatten()
+
+    problem = aopt.OptimizationProblem()
+    cam_geometry.setDvActiveStatus(True, True, False)
+    problem.addDesignVariable(cam_geometry.dv.distortionDesignVariable())
+    problem.addDesignVariable(cam_geometry.dv.projectionDesignVariable())
+    problem.addDesignVariable(cam_geometry.dv.shutterDesignVariable())
+
+    cornerUncertainty = 1.0
+    R = np.eye(2) * cornerUncertainty * cornerUncertainty
+    invR = np.linalg.inv(R)
+
+    target = cam_geometry.ctarget.detector.target()
+    proj = cam_geometry.geometry.projection()
+
+    grid_size = getattr(cam_geometry, 'weight_map_grid', 0)
+    use_weight_map = grid_size > 0
+    weight_map_power = getattr(cam_geometry, 'weight_map_power', 2.0)
+    weight_map_cutoff = getattr(cam_geometry, 'weight_map_cutoff', 0.0)
+
+    obs_records = []
+    all_jp_for_map = []
+    all_uv_for_map = []
+    all_err_for_map = []
+
+    for obs in obslist:
+        success, T_t_c = cam_geometry.geometry.estimateTransformation(obs)
+        T_mat = T_t_c.T()
+        corners_this = obs.getCornersImageFrame()
+
+        if (not success) or np.any(np.isnan(T_mat)):
+            obs_records.append({
+                "T_t_c": None,
+                "corners_this": corners_this,
+                "corner_list": [],
+            })
+            continue
+
+        T_c_t_mat = np.linalg.inv(T_mat)
+        corner_list = []
+        for i in range(target.size()):
+            valid, y = obs.imagePoint(i)
+            if not valid:
+                continue
+            p_t = np.append(target.point(i), 1.0)
+            p_cam = T_c_t_mat @ p_t
+            try:
+                kp, Jp, jvalid = proj.euclideanToKeypointJp(p_cam[:3])
+                jp_norm = np.linalg.norm(Jp) if jvalid else float('nan')
+                err_init = np.linalg.norm(y - kp) if jvalid else float('nan')
+            except Exception:
+                jp_norm = float('nan')
+                err_init = float('nan')
+            corner_list.append((i, y, jp_norm, err_init))
+            all_jp_for_map.append(jp_norm)
+            all_uv_for_map.append(y)
+            all_err_for_map.append(err_init)
+
+        obs_records.append({
+            "T_t_c": T_t_c,
+            "corners_this": corners_this,
+            "corner_list": corner_list,
+        })
+
+    weight_map = None
+    if use_weight_map and len(all_uv_for_map) > 0:
+        img_w = int(obslist[0].imCols())
+        img_h = int(obslist[0].imRows())
+        n_gx = (img_w + grid_size - 1) // grid_size
+        n_gy = (img_h + grid_size - 1) // grid_size
+
+        gc_sum = np.zeros((n_gy, n_gx))
+        gc_cnt = np.zeros((n_gy, n_gx))
+        for uv, jp, err in zip(all_uv_for_map, all_jp_for_map, all_err_for_map):
+            gc = float(np.abs(err) * jp) if (np.isfinite(jp) and np.isfinite(err)) else float('nan')
+            if not np.isfinite(gc):
+                continue
+            gx = min(int(uv[0]) // grid_size, n_gx - 1)
+            gy = min(int(uv[1]) // grid_size, n_gy - 1)
+            gc_sum[gy, gx] += gc
+            gc_cnt[gy, gx] += 1
+
+        occupied = gc_cnt > 0
+        if np.any(occupied):
+            gc_mean_map = np.where(occupied, gc_sum / np.where(occupied, gc_cnt, 1.0), np.nan)
+            median_gc = float(np.nanmedian(gc_mean_map[occupied]))
+            if median_gc <= 0 or not np.isfinite(median_gc):
+                median_gc = 1.0
+            with np.errstate(invalid='ignore', divide='ignore'):
+                ratio = np.where(occupied, median_gc / gc_mean_map, 1.0)
+            w_raw = np.where(occupied, np.clip(ratio ** weight_map_power, 0.0, 1.0), 1.0)
+            if weight_map_cutoff > 0:
+                w_raw = np.where(
+                    occupied & (gc_mean_map > weight_map_cutoff * median_gc),
+                    0.0, w_raw)
+            weight_map = w_raw
+
+    diag_uv = []
+    diag_err = []
+    diag_jp_norm = []
+    diag_weight = []
+    pose_t_list = []
+    pose_rv_list = []
+
+    for rec in obs_records:
+        T_t_c = rec["T_t_c"]
+        if T_t_c is None:
+            pose_t_list.append(np.full(3, np.nan))
+            pose_rv_list.append(np.full(3, np.nan))
+            continue
+
+        pose_t_list.append(T_t_c.t().flatten())
+        try:
+            from scipy.spatial.transform import Rotation as _ScipyR
+            pose_rv_list.append(_ScipyR.from_matrix(T_t_c.C()).as_rotvec())
+        except Exception:
+            pose_rv_list.append(np.full(3, np.nan))
+
+        target_pose_dv = addPoseDesignVariable(problem, T_t_c)
+        T_cam_w = target_pose_dv.toExpression().inverse()
+
+        for (pt_idx, y, jpn, _err_init) in rec["corner_list"]:
+            if weight_map is not None:
+                gx = min(int(y[0]) // grid_size, weight_map.shape[1] - 1)
+                gy = min(int(y[1]) // grid_size, weight_map.shape[0] - 1)
+                w = float(weight_map[gy, gx])
+                if w <= 1e-12:
+                    diag_uv.append(y.copy())
+                    diag_err.append(float('nan'))
+                    diag_jp_norm.append(jpn)
+                    diag_weight.append(0.0)
+                    continue
+                invR_w = invR * w
+            else:
+                w = 1.0
+                invR_w = invR
+
+            p_target = aopt.HomogeneousExpression(sm.toHomogeneous(target.point(pt_idx)))
+            rerr = cam_geometry.model.reprojectionError(y, invR_w, T_cam_w * p_target, cam_geometry.dv)
+            err_val = rerr.evaluateError()
+            diag_uv.append(y.copy())
+            diag_err.append(err_val)
+            diag_jp_norm.append(jpn)
+            diag_weight.append(w)
+
+    diag_uv = np.array(diag_uv) if diag_uv else np.empty((0, 2))
+    diag_err = np.array(diag_err)
+    diag_jp_norm = np.array(diag_jp_norm)
+    diag_weight = np.array(diag_weight)
+    diag_grad_contrib = np.abs(diag_err) * diag_jp_norm
+    pose_translations = np.array(pose_t_list) if pose_t_list else np.empty((0, 3))
+    pose_rotvecs = np.array(pose_rv_list) if pose_rv_list else np.empty((0, 3))
+
+    if not hasattr(cam_geometry, '_diag_per_stage'):
+        cam_geometry._diag_per_stage = {}
+    cam_geometry._diag_per_stage[mode_label] = {
+        "uv": diag_uv,
+        "reproj_err": diag_err,
+        "jp_norm": diag_jp_norm,
+        "grad_contrib": diag_grad_contrib,
+        "weight": diag_weight,
+        "weight_map": weight_map,
+        "proj_params": p_init.copy(),
+        "dist_params": d_init.copy(),
+        "pose_translations": pose_translations,
+        "pose_rotations_rotvec": pose_rotvecs,
+    }
+    return len(diag_uv) > 0
+
 def stereoCalibrate(camL_geometry, camH_geometry, obslist, distortionActive=False, baseline=None):
     #####################################################
     ## find initial guess as median of  all pnp solutions
@@ -669,4 +849,3 @@ def solveFullBatch(cameras, baseline_guesses, graph):
         baselines.append( sm.Transformation(baseline_dv.T()) )
     
     return success, baselines
-

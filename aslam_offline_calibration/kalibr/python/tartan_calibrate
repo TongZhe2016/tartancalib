@@ -53,6 +53,16 @@ cameraModels = { 'pinhole-radtan': acvb.DistortedPinhole,
                  'eucm-none':      acvb.ExtendedUnified,
                  'ds-none':        acvb.DoubleSphere}
 
+cameraModelConfigs = {
+    'pinhole-radtan': ('pinhole', 'radtan'),
+    'pinhole-equi': ('pinhole', 'equidistant'),
+    'pinhole-fov': ('pinhole', 'fov'),
+    'omni-none': ('omni', 'none'),
+    'omni-radtan': ('omni', 'radtan'),
+    'eucm-none': ('eucm', 'none'),
+    'ds-none': ('ds', 'none'),
+}
+
 DEBUG_MODES = [
     "pointcloudprojection",
     "pinholeprojection",
@@ -170,6 +180,15 @@ def parseArgs():
                                   help='FisheyeDetector corner confidence threshold (default: %(default)s)')
     fisheyeSettings.add_argument('--fisheye-min-corners', dest='fisheyeMinCorners', type=int, default=4,
                                   help='Minimum accepted corners per frame (default: %(default)s)')
+    fisheyeSettings.add_argument('--init-camchain-yaml', dest='initCamchainYaml',
+                                  default=None, metavar='FILE.yaml',
+                                  help='Path to a previous camchain yaml. When combined with '
+                                       '--skip-intrinsics-init, use its intrinsics/distortion as '
+                                       'the optimization start point.')
+    fisheyeSettings.add_argument('--skip-intrinsics-init', action='store_true',
+                                  dest='skipIntrinsicsInit',
+                                  help='Skip initializeIntrinsics/calibrateIntrinsics and trust '
+                                       '--init-camchain-yaml as the starting geometry.')
 
     outputSettings = parser.add_argument_group('Output options')
     outputSettings.add_argument('--verbose', action='store_true', dest='verbose', help='Enable (really) verbose output (disables plots)')
@@ -211,6 +230,81 @@ def parseArgs():
 
     return parsed
 
+
+def _load_initial_camera_params(init_camchain_yaml):
+    if not init_camchain_yaml:
+        return {}
+
+    chain = kc.CameraChainParameters(init_camchain_yaml)
+    params_by_topic = {}
+    for cam_idx in range(chain.numCameras()):
+        cam_cfg = chain.getCameraParameters(cam_idx)
+        camera_model, intrinsics = cam_cfg.getIntrinsics()
+        dist_model, dist_coeffs = cam_cfg.getDistortion()
+        resolution = cam_cfg.getResolution()
+        topic = cam_cfg.getRosTopic()
+        params_by_topic[topic] = {
+            "camera_model": camera_model,
+            "dist_model": dist_model,
+            "intrinsics": intrinsics,
+            "dist_coeffs": dist_coeffs,
+            "resolution": resolution,
+            "cam_idx": cam_idx,
+        }
+    print("Loaded initial camera parameters for {0} topic(s) from: {1}".format(
+        len(params_by_topic), init_camchain_yaml))
+    return params_by_topic
+
+
+def _apply_initial_camera_geometry(cam, topic, model_name, init_entry):
+    if model_name not in cameraModelConfigs:
+        raise RuntimeError("Unknown camera model: {0}".format(model_name))
+
+    expected_camera_model, expected_dist_model = cameraModelConfigs[model_name]
+    if init_entry["camera_model"] != expected_camera_model:
+        raise RuntimeError(
+            "Initial camchain model mismatch for topic {0}: expected {1}, got {2}".format(
+                topic, expected_camera_model, init_entry["camera_model"]))
+    if init_entry["dist_model"] != expected_dist_model:
+        raise RuntimeError(
+            "Initial camchain distortion mismatch for topic {0}: expected {1}, got {2}".format(
+                topic, expected_dist_model, init_entry["dist_model"]))
+
+    proj = np.array(init_entry["intrinsics"], dtype=float)
+    dist = np.array(init_entry["dist_coeffs"], dtype=float)
+    current_proj = cam.geometry.projection().getParameters().flatten()
+    current_dist = cam.geometry.projection().distortion().getParameters().flatten()
+    if len(proj) != len(current_proj):
+        raise RuntimeError(
+            "Initial camchain intrinsics length mismatch for topic {0}: expected {1}, got {2}".format(
+                topic, len(current_proj), len(proj)))
+    if len(dist) != len(current_dist):
+        raise RuntimeError(
+            "Initial camchain distortion length mismatch for topic {0}: expected {1}, got {2}".format(
+                topic, len(current_dist), len(dist)))
+
+    cam.geometry.projection().setParameters(proj)
+    cam.geometry.projection().distortion().setParameters(dist)
+    cam.isGeometryInitialized = True
+    print("\tApplied initial camera parameters from camchain cam{0} ({1})".format(
+        init_entry["cam_idx"], topic))
+
+
+def _initialize_camera_geometry(cam, observations, topic, model_name, parsed, initial_camera_params):
+    init_entry = initial_camera_params.get(topic)
+    if parsed.skipIntrinsicsInit:
+        if init_entry is None:
+            raise RuntimeError(
+                "--skip-intrinsics-init requires a matching topic in --init-camchain-yaml for {0}".format(
+                    topic))
+        _apply_initial_camera_geometry(cam, topic, model_name, init_entry)
+        return True
+
+    if init_entry is not None:
+        print("\t[INFO] Initial camchain found for {0}, but intrinsic init will still run because "
+              "--skip-intrinsics-init was not set.".format(topic))
+    return cam.initGeometryFromObservations(observations)
+
 def _binned_stat(uv, values, img_w, img_h, bins=40, stat='mean'):
     """Bin scattered (u,v) data into a 2D grid, aggregating with `stat`."""
     from scipy.stats import binned_statistic_2d
@@ -230,6 +324,71 @@ def _save_corner_diagnostics(cam, cam_id, topic, observations,
                               img_w, img_h, save_dir, bins=40):
     """Generate corner density + gradient heatmaps and cache raw numpy data."""
     from matplotlib.colors import LogNorm
+
+    def _scatter_with_optional_lognorm(ax, uv_in, values_in, colorbar_label, title,
+                                       cmap='plasma'):
+        vals = np.asarray(values_in, dtype=float).reshape(-1)
+        finite_mask = np.isfinite(vals)
+        uv_f = uv_in[finite_mask]
+        vals_f = vals[finite_mask]
+
+        if len(vals_f) == 0:
+            ax.text(0.5, 0.5, 'No finite samples', ha='center', va='center',
+                    transform=ax.transAxes)
+            ax.set_title(title)
+            ax.set_xlim(0, img_w)
+            ax.set_ylim(img_h, 0)
+            ax.set_xlabel('x (px)')
+            ax.set_ylabel('y (px)')
+            ax.set_aspect('equal')
+            return
+
+        pos = vals_f[vals_f > 0]
+        scatter_kwargs = dict(s=0.6, alpha=0.4, cmap=cmap)
+        if len(pos) > 0:
+            vmin = max(np.nanpercentile(pos, 1), 1e-3)
+            vmax = np.nanpercentile(pos, 99)
+            if not np.isfinite(vmax) or vmax <= vmin:
+                vmax = max(vmin * 10.0, vmin + 1e-6)
+            vals_plot = vals_f.copy()
+            vals_plot[vals_plot <= 0] = vmin
+            sc = ax.scatter(
+                uv_f[:, 0], uv_f[:, 1], c=vals_plot,
+                norm=LogNorm(vmin=vmin, vmax=vmax), **scatter_kwargs)
+        else:
+            sc = ax.scatter(uv_f[:, 0], uv_f[:, 1], c=vals_f, **scatter_kwargs)
+
+        fig2.colorbar(sc, ax=ax, label=colorbar_label)
+        ax.set_xlim(0, img_w)
+        ax.set_ylim(img_h, 0)
+        ax.set_xlabel('x (px)')
+        ax.set_ylabel('y (px)')
+        ax.set_title(title)
+        ax.set_aspect('equal')
+
+    def _imshow_with_optional_lognorm(ax, image, colorbar_label, title, cmap='inferno'):
+        img = np.asarray(image, dtype=float)
+        finite = np.isfinite(img)
+        positive = finite & (img > 0)
+        if np.any(positive):
+            vmin = max(np.nanmin(img[positive]), 1e-3)
+            vmax = np.nanmax(img[finite])
+            if not np.isfinite(vmax) or vmax <= vmin:
+                vmax = max(vmin * 10.0, vmin + 1e-6)
+            norm = LogNorm(vmin=vmin, vmax=vmax)
+            plot_img = img.copy()
+            plot_img[~finite] = np.nan
+            plot_img[plot_img <= 0] = np.nan
+        else:
+            norm = None
+            plot_img = np.nan_to_num(img, nan=0.0, posinf=0.0, neginf=0.0)
+
+        im = ax.imshow(plot_img, origin='upper', cmap=cmap, interpolation='bilinear',
+                       extent=[0, img_w, img_h, 0], aspect='auto', norm=norm)
+        fig2.colorbar(im, ax=ax, label=colorbar_label)
+        ax.set_xlabel('x (px)')
+        ax.set_ylabel('y (px)')
+        ax.set_title(title)
 
     all_corners = np.vstack([obs.getCornersImageFrame() for obs in observations])
     per_frame_count = np.array([obs.getCornersImageFrame().shape[0] for obs in observations])
@@ -304,59 +463,29 @@ def _save_corner_diagnostics(cam, cam_id, topic, observations,
 
         # (0,0) Reprojection error scatter (log color)
         ax = axes2[0, 0]
-        fe = np.abs(reproj_err).copy()
-        fe[~np.isfinite(fe)] = np.nan
-        fe_clip = np.clip(fe, 1e-3, None)
-        sc = ax.scatter(uv[:, 0], uv[:, 1], c=fe_clip, s=0.6, alpha=0.4,
-                        cmap='plasma', norm=LogNorm(vmin=max(np.nanpercentile(fe_clip, 1), 1e-2),
-                                                    vmax=np.nanpercentile(fe_clip, 99)))
-        fig2.colorbar(sc, ax=ax, label='|reproj err|')
-        ax.set_xlim(0, img_w); ax.set_ylim(img_h, 0)
-        ax.set_xlabel('x (px)'); ax.set_ylabel('y (px)')
-        ax.set_title('Reprojection Error (per corner)')
-        ax.set_aspect('equal')
+        fe = np.abs(np.asarray(reproj_err, dtype=float))
+        _scatter_with_optional_lognorm(
+            ax, uv, fe, '|reproj err|', 'Reprojection Error (per corner)')
 
         # (0,1) Jacobian norm scatter (log color)
         ax = axes2[0, 1]
-        jn = jp_norm.copy()
-        jn[~np.isfinite(jn)] = np.nan
-        jn_clip = np.clip(jn, 1e-3, None)
-        sc = ax.scatter(uv[:, 0], uv[:, 1], c=jn_clip, s=0.6, alpha=0.4,
-                        cmap='plasma', norm=LogNorm(vmin=max(np.nanpercentile(jn_clip, 1), 1e-2),
-                                                    vmax=np.nanpercentile(jn_clip, 99)))
-        fig2.colorbar(sc, ax=ax, label='||J_p||_F')
-        ax.set_xlim(0, img_w); ax.set_ylim(img_h, 0)
-        ax.set_xlabel('x (px)'); ax.set_ylabel('y (px)')
-        ax.set_title('Projection Jacobian Norm ||∂π/∂p||')
-        ax.set_aspect('equal')
+        jn = np.abs(np.asarray(jp_norm, dtype=float))
+        _scatter_with_optional_lognorm(
+            ax, uv, jn, '||J_p||_F', 'Projection Jacobian Norm ||∂π/∂p||')
 
         # (1,0) Gradient contribution scatter (log color)
         ax = axes2[1, 0]
-        gc = grad_contrib.copy()
-        gc[~np.isfinite(gc)] = np.nan
-        gc_clip = np.clip(gc, 1e-3, None)
-        sc = ax.scatter(uv[:, 0], uv[:, 1], c=gc_clip, s=0.6, alpha=0.4,
-                        cmap='plasma', norm=LogNorm(vmin=max(np.nanpercentile(gc_clip, 1), 1e-2),
-                                                    vmax=np.nanpercentile(gc_clip, 99)))
-        fig2.colorbar(sc, ax=ax, label='|err| · ||J||')
-        ax.set_xlim(0, img_w); ax.set_ylim(img_h, 0)
-        ax.set_xlabel('x (px)'); ax.set_ylabel('y (px)')
-        ax.set_title('Gradient Contribution |e|·||J||')
-        ax.set_aspect('equal')
+        gc = np.abs(np.asarray(grad_contrib, dtype=float))
+        _scatter_with_optional_lognorm(
+            ax, uv, gc, '|err| · ||J||', 'Gradient Contribution |e|·||J||')
 
         # (1,1) Gradient contribution binned heatmap
         ax = axes2[1, 1]
-        H_gc, xe, ye = _binned_stat(uv, grad_contrib, img_w, img_h, bins=bins, stat='mean')
+        H_gc, xe, ye = _binned_stat(uv, gc, img_w, img_h, bins=bins, stat='mean')
         H_gc_plot = H_gc.T.copy()
         H_gc_plot[H_gc_plot <= 0] = np.nan
-        im = ax.imshow(H_gc_plot, origin='upper', cmap='inferno', interpolation='bilinear',
-                       extent=[0, img_w, img_h, 0], aspect='auto',
-                       norm=LogNorm(vmin=max(np.nanmin(H_gc_plot[H_gc_plot > 0]), 1e-2)
-                                    if np.any(H_gc_plot > 0) else 1e-2,
-                                    vmax=np.nanmax(H_gc_plot) if np.any(np.isfinite(H_gc_plot)) else 1))
-        fig2.colorbar(im, ax=ax, label='mean |e|·||J||')
-        ax.set_xlabel('x (px)'); ax.set_ylabel('y (px)')
-        ax.set_title('Gradient Contribution Heatmap (binned)')
+        _imshow_with_optional_lognorm(
+            ax, H_gc_plot, 'mean |e|·||J||', 'Gradient Contribution Heatmap (binned)')
 
         pl.tight_layout()
         p2 = os.path.join(save_dir, 'cam{0}_gradient_{1}.png'.format(cam_id, stage_name))
@@ -364,8 +493,8 @@ def _save_corner_diagnostics(cam, cam_id, topic, observations,
         print("\tGradient diagnostics ({0}) saved to: {1}".format(stage_name, p2))
 
         # Binned heatmaps for error and Jacobian too
-        H_err, _, _ = _binned_stat(uv, np.abs(reproj_err), img_w, img_h, bins=bins, stat='mean')
-        H_jp, _, _ = _binned_stat(uv, jp_norm, img_w, img_h, bins=bins, stat='mean')
+        H_err, _, _ = _binned_stat(uv, fe, img_w, img_h, bins=bins, stat='mean')
+        H_jp, _, _ = _binned_stat(uv, jn, img_w, img_h, bins=bins, stat='mean')
 
         raw["diag_{0}_uv".format(stage_name)] = uv
         raw["diag_{0}_reproj_err".format(stage_name)] = reproj_err
@@ -610,6 +739,7 @@ def main():
     signal.signal(signal.SIGINT, signal_exit)
 
     targetConfig = kc.CalibrationTargetParameters(parsed.targetYaml)
+    initial_camera_params = _load_initial_camera_params(parsed.initCamchainYaml)
 
     #create camera objects, initialize the intrinsics and extract targets
     cameraList = list()
@@ -656,7 +786,16 @@ def main():
             cam.weight_map_grid    = parsed.weightMapGrid
             cam.weight_map_power   = parsed.weightMapPower
             cam.weight_map_cutoff  = parsed.weightMapCutoff
-            init_success = cam.initGeometryFromObservations(observations)
+            init_success = _initialize_camera_geometry(
+                cam, observations, topic, modelName, parsed, initial_camera_params)
+
+            if parsed.skipIntrinsicsInit and topic in initial_camera_params:
+                try:
+                    kcc.collectStageDiagnostics(cam, observations, mode_label="loaded_init")
+                except Exception as e:
+                    import traceback
+                    print("\t[WARN] Loaded-init diagnostics generation failed: {0}".format(e))
+                    traceback.print_exc()
 
             # Generate all diagnostics (corner density + gradient heatmaps + raw data)
             try:
@@ -997,6 +1136,22 @@ def main():
                 print("Processed {0} images with {1} images used".format(numViews, calibrator.estimator.getNumBatches()))
                 kcc.printParameters(calibrator)
 
+                for cam_id, cam in enumerate(cameraList):
+                    try:
+                        final_observations = obsdb.getAllObsCam(cam_id)
+                        if len(final_observations) == 0:
+                            continue
+                        kcc.collectStageDiagnostics(cam, final_observations, mode_label="final")
+                        img_w_final = int(final_observations[0].imCols())
+                        img_h_final = int(final_observations[0].imRows())
+                        _save_corner_diagnostics(
+                            cam, cam_id, cam.dataset.topic, final_observations,
+                            img_w_final, img_h_final, parsed.saveDir)
+                    except Exception as e:
+                        import traceback
+                        print("\t[WARN] Final diagnostics generation failed for cam{0}: {1}".format(cam_id, e))
+                        traceback.print_exc()
+
                 if parsed.verbose and len(calibrator.baselines)>1:
                     f=pl.figure(100006)
                     kcc.plotCameraRig(calibrator.baselines, fno=f.number, clearFigure=False)
@@ -1035,8 +1190,12 @@ def main():
                     for cam_id, cam in enumerate(cameraList):
                         print("Reinitialize the intrinsics for camera {0}".format(cam_id))
                         observations = obsdb.getAllObsCam(cam_id)
-                        if not cam.initGeometryFromObservations(observations):
-                            raise RuntimeError("Could not re-initialize the intrinsics for camera with topic: {0}".format(topic))
+                        if not _initialize_camera_geometry(
+                                cam, observations, cam.dataset.topic, parsed.models[cam_id],
+                                parsed, initial_camera_params):
+                            raise RuntimeError(
+                                "Could not re-initialize the intrinsics for camera with topic: {0}".format(
+                                    cam.dataset.topic))
 
                         print("\tProjection initialized to: %s" % cam.geometry.projection().getParameters().flatten())
                         print("\tDistortion initialized to: %s" % cam.geometry.projection().distortion().getParameters().flatten())
