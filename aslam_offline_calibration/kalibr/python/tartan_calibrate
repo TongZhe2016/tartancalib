@@ -189,6 +189,13 @@ def parseArgs():
                                   dest='skipIntrinsicsInit',
                                   help='Skip initializeIntrinsics/calibrateIntrinsics and trust '
                                        '--init-camchain-yaml as the starting geometry.')
+    fisheyeSettings.add_argument(
+        '--extrinsics-only',
+        action='store_true',
+        dest='extrinsicsOnly',
+        help='Freeze intrinsics/distortion in incremental BA (optimize baselines and target poses only). '
+             'Requires --skip-intrinsics-init and --init-camchain-yaml.',
+    )
 
     outputSettings = parser.add_argument_group('Output options')
     outputSettings.add_argument('--verbose', action='store_true', dest='verbose', help='Enable (really) verbose output (disables plots)')
@@ -218,6 +225,11 @@ def parseArgs():
     if len(parsed.topics) != len(parsed.models):
         sm.logError("Please specify exactly one camera model (--models) for each topic (--topics).")
         sys.exit(2)
+
+    if getattr(parsed, "extrinsicsOnly", False):
+        if not parsed.skipIntrinsicsInit or not parsed.initCamchainYaml:
+            sm.logError("--extrinsics-only requires --skip-intrinsics-init and --init-camchain-yaml")
+            sys.exit(2)
 
     if parsed.minViewOutlier<1:
         sm.logError("Please specify a positive integer (--min-views-outlier).")
@@ -875,7 +887,17 @@ def main():
                     polar_object.mode = kcc.PolarOptions.RAND_BIN_PICK
                     polar_object.numBins = 50
 
-                calibrator = kcc.CameraCalibration(cameraList, baseline_guesses, verbose=parsed.verbose, useBlakeZissermanMest=parsed.doBlakeZisserman,polarObject=polar_object)
+                if getattr(parsed, "extrinsicsOnly", False):
+                    print("\t[INFO] --extrinsics-only: intrinsics/distortion frozen in incremental BA only "
+                          "(MulticamGraph.getInitialGuesses still uses joint intrinsics+extrinsics).")
+                calibrator = kcc.CameraCalibration(
+                    cameraList,
+                    baseline_guesses,
+                    verbose=parsed.verbose,
+                    useBlakeZissermanMest=parsed.doBlakeZisserman,
+                    polarObject=polar_object,
+                    intrinsics_active=(not getattr(parsed, "extrinsicsOnly", False)),
+                )
 
                 if polar_object.mode == kcc.PolarOptions.RAND_BIN_PICK :
                     calibrator.getPolarDistribution(obsdb,kcc.CalibrationTarget(cameraList[0].ctarget.detector.target()),cameraList)

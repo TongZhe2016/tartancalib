@@ -193,7 +193,7 @@ class PolarWeighting(object):
 
 class CalibrationTargetOptimizationProblem(ic.CalibrationOptimizationProblem):        
     @classmethod
-    def fromTargetViewObservations(cls, cameras, target, baselines, T_tc_guess, rig_observations, useBlakeZissermanMest=False,polarObject=PolarWeighting()):
+    def fromTargetViewObservations(cls, cameras, target, baselines, T_tc_guess, rig_observations, useBlakeZissermanMest=False,polarObject=PolarWeighting(), intrinsics_active=True):
         rval = CalibrationTargetOptimizationProblem()        
 
         #store the arguements in case we want to rebuild a modified problem
@@ -202,6 +202,7 @@ class CalibrationTargetOptimizationProblem(ic.CalibrationOptimizationProblem):
         rval.baselines = baselines
         rval.T_tc_guess = T_tc_guess
         rval.rig_observations = rig_observations
+        rval.intrinsics_active = bool(intrinsics_active)
         
         # 1. Create a design variable for this pose
         T_target_camera = T_tc_guess
@@ -223,7 +224,7 @@ class CalibrationTargetOptimizationProblem(ic.CalibrationOptimizationProblem):
         for camera in cameras:
             if not camera.isGeometryInitialized:
                 raise RuntimeError('The camera geometry is not initialized. Please initialize with initGeometry() or initGeometryFromDataset()')
-            camera.setDvActiveStatus(True, True, False)
+            camera.setDvActiveStatus(bool(intrinsics_active), bool(intrinsics_active), False)
             rval.addDesignVariable(camera.dv.distortionDesignVariable(), CALIBRATION_GROUP_ID)
             rval.addDesignVariable(camera.dv.projectionDesignVariable(), CALIBRATION_GROUP_ID)
             rval.addDesignVariable(camera.dv.shutterDesignVariable(), CALIBRATION_GROUP_ID)
@@ -305,13 +306,15 @@ def removeCornersFromBatch(batch, camId_cornerIdList_tuples, useBlakeZissermanMe
     assert hasCornerRemoved, "need to remove at least one corner..."
     
     #rebuild problem
+    ia = getattr(batch, "intrinsics_active", True)
     new_problem = CalibrationTargetOptimizationProblem.fromTargetViewObservations(batch.cameras, 
                                                                                   batch.target, 
                                                                                   batch.baselines, 
                                                                                   batch.T_tc_guess, 
                                                                                   batch.rig_observations,
                                                                                   useBlakeZissermanMest=useBlakeZissermanMest,
-                                                                                  polarObject=polarObject)
+                                                                                  polarObject=polarObject,
+                                                                                  intrinsics_active=ia)
 
     return new_problem
 
@@ -319,11 +322,12 @@ def removeCornersFromBatch(batch, camId_cornerIdList_tuples, useBlakeZissermanMe
 
 
 class CameraCalibration(object):
-    def __init__(self, cameras, baseline_guesses, estimateLandmarks=False, verbose=False, useBlakeZissermanMest=False, polarObject=PolarWeighting()):
+    def __init__(self, cameras, baseline_guesses, estimateLandmarks=False, verbose=False, useBlakeZissermanMest=False, polarObject=PolarWeighting(), intrinsics_active=True):
         print("STARTING MODE")
         print(polarObject.mode)
         self.cameras = cameras
         self.useBlakeZissermanMest = useBlakeZissermanMest
+        self.intrinsics_active = bool(intrinsics_active)
 
         self.polarObject = polarObject # tartan implementation: more weight to corners that are closer to the edge of the frame
         #create the incremental estimator
@@ -373,7 +377,10 @@ class CameraCalibration(object):
         #create the problem for this batch and try to add it 
 
 
-        batch_problem = CalibrationTargetOptimizationProblem.fromTargetViewObservations(self.cameras, self.target, self.baselines, T_tc_guess, rig_observations, useBlakeZissermanMest=self.useBlakeZissermanMest, polarObject=self.polarObject)
+        batch_problem = CalibrationTargetOptimizationProblem.fromTargetViewObservations(
+            self.cameras, self.target, self.baselines, T_tc_guess, rig_observations,
+            useBlakeZissermanMest=self.useBlakeZissermanMest, polarObject=self.polarObject,
+            intrinsics_active=self.intrinsics_active)
         
         self.estimator_return_value = self.estimator.addBatch(batch_problem, force)
         
