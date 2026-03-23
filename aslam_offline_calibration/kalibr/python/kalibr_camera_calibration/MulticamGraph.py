@@ -112,7 +112,7 @@ class MulticamCalibrationGraph(object):
     #returns: 
     #        baselines:    list of baselines starting from cam0 to camN
     #                      direction: baseline_O => cam0 to cam1 (T_c1_c0)
-    def getInitialGuesses(self, cameras):
+    def getInitialGuesses(self, cameras, baseline_seed=None, intrinsics_active=True):
         
         if not self.G:
             raise RuntimeError("Graph is uninitialized!")
@@ -158,6 +158,12 @@ class MulticamCalibrationGraph(object):
         #################################################################
         
         #calibrate all cameras in pairs
+        seed_baselines = list(baseline_seed) if baseline_seed is not None else None
+        if seed_baselines is not None and len(seed_baselines) != (self.numCams - 1):
+            raise RuntimeError(
+                "baseline_seed must contain exactly {0} transforms".format(self.numCams - 1)
+            )
+
         for baseline_edge_id in self.optimal_baseline_edges:
 
             #get the cam_nrs from the graph edge (calibrate from low to high id)
@@ -173,10 +179,17 @@ class MulticamCalibrationGraph(object):
 
             #run the pair extrinsic calibration
             obs_list = self.obs_db.getAllObsTwoCams(camL_nr, camH_nr)
+            baseline_guess = None
+            if seed_baselines is not None:
+                baseline_guess = sm.Transformation()
+                for baseline_idx in range(camL_nr, camH_nr):
+                    baseline_guess = seed_baselines[baseline_idx] * baseline_guess
             success, baseline_HL = kcc.stereoCalibrate(cameras[camL_nr], 
                                                        cameras[camH_nr], 
                                                        obs_list,
-                                                       distortionActive=False)
+                                                       distortionActive=False,
+                                                       baseline=baseline_guess,
+                                                       intrinsicsActive=intrinsics_active)
             
             if success:
                 sm.logDebug("baseline_{0}_{1}={2}".format(camL_nr, camH_nr, baseline_HL.T()))
@@ -226,7 +239,7 @@ class MulticamCalibrationGraph(object):
         #################################################################
         ## STEP 4: refine guess in full batch
         #################################################################
-        success, baselines = kcc.solveFullBatch(cameras, baselines, self)
+        success, baselines = kcc.solveFullBatch(cameras, baselines, self, intrinsicsActive=intrinsics_active)
         
         if not success:
             sm.logWarn("Full batch refinement failed!")

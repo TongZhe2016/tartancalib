@@ -4,7 +4,6 @@ print("importing libraries")
 # Schweizer-Messer (swiss-army knife utils)
 from matplotlib.offsetbox import DEBUG
 import sm
-from sm import PlotCollection
 
 # Kalibr Modules
 import aslam_cv_backend as acvb
@@ -184,16 +183,25 @@ def parseArgs():
                                   default=None, metavar='FILE.yaml',
                                   help='Path to a previous camchain yaml. When combined with '
                                        '--skip-intrinsics-init, use its intrinsics/distortion as '
-                                       'the optimization start point.')
+                                       'the optimization start point. If rig baselines are present, '
+                                       'they are also used as baseline seeds.')
     fisheyeSettings.add_argument('--skip-intrinsics-init', action='store_true',
                                   dest='skipIntrinsicsInit',
                                   help='Skip initializeIntrinsics/calibrateIntrinsics and trust '
                                        '--init-camchain-yaml as the starting geometry.')
     fisheyeSettings.add_argument(
+        '--intrinsics-only',
+        action='store_true',
+        dest='intrinsicsOnly',
+        help='Keep normal initialization and baseline seeding, but freeze rig baselines/extrinsics during '
+             'incremental BA (optimize intrinsics/distortion and target poses only).',
+    )
+    fisheyeSettings.add_argument(
         '--extrinsics-only',
         action='store_true',
         dest='extrinsicsOnly',
-        help='Freeze intrinsics/distortion in incremental BA (optimize baselines and target poses only). '
+        help='Freeze intrinsics/distortion throughout baseline initialization and incremental BA '
+             '(optimize baselines and target poses only). '
              'Requires --skip-intrinsics-init and --init-camchain-yaml.',
     )
 
@@ -224,6 +232,10 @@ def parseArgs():
     # Checks required for TartanCalib to run.
     if len(parsed.topics) != len(parsed.models):
         sm.logError("Please specify exactly one camera model (--models) for each topic (--topics).")
+        sys.exit(2)
+
+    if getattr(parsed, "intrinsicsOnly", False) and getattr(parsed, "extrinsicsOnly", False):
+        sm.logError("--intrinsics-only and --extrinsics-only are mutually exclusive")
         sys.exit(2)
 
     if getattr(parsed, "extrinsicsOnly", False):
@@ -266,6 +278,26 @@ def _load_initial_camera_params(init_camchain_yaml):
     print("Loaded initial camera parameters for {0} topic(s) from: {1}".format(
         len(params_by_topic), init_camchain_yaml))
     return params_by_topic
+
+
+def _load_initial_baselines(init_camchain_yaml):
+    if not init_camchain_yaml:
+        return None
+
+    chain = kc.CameraChainParameters(init_camchain_yaml)
+    if chain.numCameras() <= 1:
+        return []
+
+    baselines = []
+    try:
+        for cam_idx in range(1, chain.numCameras()):
+            baselines.append(chain.getExtrinsicsLastCamToHere(cam_idx))
+    except Exception:
+        print("No complete baseline seed found in camchain: {0}".format(init_camchain_yaml))
+        return None
+
+    print("Loaded {0} baseline seed(s) from: {1}".format(len(baselines), init_camchain_yaml))
+    return baselines
 
 
 def _apply_initial_camera_geometry(cam, topic, model_name, init_entry):
@@ -752,6 +784,7 @@ def main():
 
     targetConfig = kc.CalibrationTargetParameters(parsed.targetYaml)
     initial_camera_params = _load_initial_camera_params(parsed.initCamchainYaml)
+    initial_baseline_params = _load_initial_baselines(parsed.initCamchainYaml)
 
     #create camera objects, initialize the intrinsics and extract targets
     cameraList = list()
@@ -858,7 +891,23 @@ def main():
                 #compute initial guesses for the baselines, intrinsics
                 print("initializing initial guesses")
                 if len(cameraList)>1:
-                    baseline_guesses = graph.getInitialGuesses(cameraList)
+                    baseline_seed = None
+                    if initial_baseline_params is not None:
+                        if len(initial_baseline_params) != (len(cameraList) - 1):
+                            raise RuntimeError(
+                                "Initial baseline count mismatch: expected {0}, got {1}".format(
+                                    len(cameraList) - 1, len(initial_baseline_params))
+                            )
+                        baseline_seed = initial_baseline_params
+                    if getattr(parsed, "extrinsicsOnly", False) and baseline_seed is None:
+                        raise RuntimeError(
+                            "--extrinsics-only requires rig baselines in --init-camchain-yaml"
+                        )
+                    baseline_guesses = graph.getInitialGuesses(
+                        cameraList,
+                        baseline_seed=baseline_seed,
+                        intrinsics_active=(not getattr(parsed, "extrinsicsOnly", False)),
+                    )
                 else:
                     baseline_guesses=[]
 
@@ -887,9 +936,10 @@ def main():
                     polar_object.mode = kcc.PolarOptions.RAND_BIN_PICK
                     polar_object.numBins = 50
 
+                if getattr(parsed, "intrinsicsOnly", False):
+                    print("\t[INFO] --intrinsics-only: baseline/extrinsics frozen in incremental BA.")
                 if getattr(parsed, "extrinsicsOnly", False):
-                    print("\t[INFO] --extrinsics-only: intrinsics/distortion frozen in incremental BA only "
-                          "(MulticamGraph.getInitialGuesses still uses joint intrinsics+extrinsics).")
+                    print("\t[INFO] --extrinsics-only: intrinsics/distortion frozen in baseline init and incremental BA.")
                 calibrator = kcc.CameraCalibration(
                     cameraList,
                     baseline_guesses,
@@ -897,6 +947,7 @@ def main():
                     useBlakeZissermanMest=parsed.doBlakeZisserman,
                     polarObject=polar_object,
                     intrinsics_active=(not getattr(parsed, "extrinsicsOnly", False)),
+                    baseline_active=(not getattr(parsed, "intrinsicsOnly", False)),
                 )
 
                 if polar_object.mode == kcc.PolarOptions.RAND_BIN_PICK :
@@ -960,6 +1011,7 @@ def main():
 
                     #plot added views
                     if success and doPlot:
+                        from sm import PlotCollection
                         recent_view = calibrator.views[-1]
                         cams_in_view = [obs_tuple[0] for obs_tuple in recent_view.rig_observations]
                         plotter = PlotCollection.PlotCollection("Added view (stamp: {0})".format(timestamp))
@@ -1183,6 +1235,10 @@ def main():
                 resultFile = os.path.join(parsed.saveDir, parsed.logDest + str(iteration)  + "-camchain.yaml")
                 kcc.saveChainParametersYaml(calibrator, resultFile, graph)
                 print("Results written to file: {0}".format(resultFile))
+                if len(cameraList) > 1 and initial_baseline_params is not None:
+                    initial_baseline_params = [
+                        sm.Transformation(baseline_dv.T()) for baseline_dv in calibrator.baselines
+                    ]
 
                 # Write detailed results to file
                 resultFileTxt = os.path.join(parsed.saveDir, parsed.logDest + str(iteration) + "-results-cam.txt")

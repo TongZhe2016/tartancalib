@@ -193,7 +193,18 @@ class PolarWeighting(object):
 
 class CalibrationTargetOptimizationProblem(ic.CalibrationOptimizationProblem):        
     @classmethod
-    def fromTargetViewObservations(cls, cameras, target, baselines, T_tc_guess, rig_observations, useBlakeZissermanMest=False,polarObject=PolarWeighting(), intrinsics_active=True):
+    def fromTargetViewObservations(
+        cls,
+        cameras,
+        target,
+        baselines,
+        T_tc_guess,
+        rig_observations,
+        useBlakeZissermanMest=False,
+        polarObject=PolarWeighting(),
+        intrinsics_active=True,
+        baseline_active=True,
+    ):
         rval = CalibrationTargetOptimizationProblem()        
 
         #store the arguements in case we want to rebuild a modified problem
@@ -203,6 +214,7 @@ class CalibrationTargetOptimizationProblem(ic.CalibrationOptimizationProblem):
         rval.T_tc_guess = T_tc_guess
         rval.rig_observations = rig_observations
         rval.intrinsics_active = bool(intrinsics_active)
+        rval.baseline_active = bool(baseline_active)
         
         # 1. Create a design variable for this pose
         T_target_camera = T_tc_guess
@@ -214,7 +226,9 @@ class CalibrationTargetOptimizationProblem(ic.CalibrationOptimizationProblem):
         #2. add all baselines DVs
         for baseline_dv in baselines:
             for i in range(0, baseline_dv.numDesignVariables()):
-                rval.addDesignVariable(baseline_dv.getDesignVariable(i), CALIBRATION_GROUP_ID)
+                dv = baseline_dv.getDesignVariable(i)
+                dv.setActive(bool(baseline_active))
+                rval.addDesignVariable(dv, CALIBRATION_GROUP_ID)
         
         #3. add landmark DVs
         for p in target.P_t_dv:
@@ -307,6 +321,7 @@ def removeCornersFromBatch(batch, camId_cornerIdList_tuples, useBlakeZissermanMe
     
     #rebuild problem
     ia = getattr(batch, "intrinsics_active", True)
+    ba = getattr(batch, "baseline_active", True)
     new_problem = CalibrationTargetOptimizationProblem.fromTargetViewObservations(batch.cameras, 
                                                                                   batch.target, 
                                                                                   batch.baselines, 
@@ -314,7 +329,8 @@ def removeCornersFromBatch(batch, camId_cornerIdList_tuples, useBlakeZissermanMe
                                                                                   batch.rig_observations,
                                                                                   useBlakeZissermanMest=useBlakeZissermanMest,
                                                                                   polarObject=polarObject,
-                                                                                  intrinsics_active=ia)
+                                                                                  intrinsics_active=ia,
+                                                                                  baseline_active=ba)
 
     return new_problem
 
@@ -322,12 +338,23 @@ def removeCornersFromBatch(batch, camId_cornerIdList_tuples, useBlakeZissermanMe
 
 
 class CameraCalibration(object):
-    def __init__(self, cameras, baseline_guesses, estimateLandmarks=False, verbose=False, useBlakeZissermanMest=False, polarObject=PolarWeighting(), intrinsics_active=True):
+    def __init__(
+        self,
+        cameras,
+        baseline_guesses,
+        estimateLandmarks=False,
+        verbose=False,
+        useBlakeZissermanMest=False,
+        polarObject=PolarWeighting(),
+        intrinsics_active=True,
+        baseline_active=True,
+    ):
         print("STARTING MODE")
         print(polarObject.mode)
         self.cameras = cameras
         self.useBlakeZissermanMest = useBlakeZissermanMest
         self.intrinsics_active = bool(intrinsics_active)
+        self.baseline_active = bool(baseline_active)
 
         self.polarObject = polarObject # tartan implementation: more weight to corners that are closer to the edge of the frame
         #create the incremental estimator
@@ -380,7 +407,8 @@ class CameraCalibration(object):
         batch_problem = CalibrationTargetOptimizationProblem.fromTargetViewObservations(
             self.cameras, self.target, self.baselines, T_tc_guess, rig_observations,
             useBlakeZissermanMest=self.useBlakeZissermanMest, polarObject=self.polarObject,
-            intrinsics_active=self.intrinsics_active)
+            intrinsics_active=self.intrinsics_active,
+            baseline_active=self.baseline_active)
         
         self.estimator_return_value = self.estimator.addBatch(batch_problem, force)
         
@@ -545,7 +573,12 @@ def getAllPointStatistics(cself, cam_id):
 def plotPolarError(cself, cam_id, fno=1, clearFigure=True, stats=None, noShow=False, title=""):
     if stats is None:
         stats = getAllPointStatistics(cself, cam_id)
-    angleError = np.array([ [ np.degrees(s.polarAngle), math.sqrt(s.squaredError)] for s in stats ])
+    angleError = np.array([ [ np.degrees(s.polarAngle), math.sqrt(s.squaredError)] for s in stats ], dtype=float)
+    # Empty stats -> np.array([]) is 1D (0,); need (0, 2) for column indexing below.
+    if angleError.size == 0:
+        angleError = np.zeros((0, 2))
+    elif angleError.ndim == 1:
+        angleError = angleError.reshape(1, -1)
     # sort by polar angle
     sae = angleError[ angleError[:,0].argsort() ]
     
@@ -571,7 +604,11 @@ def plotPolarError(cself, cam_id, fno=1, clearFigure=True, stats=None, noShow=Fa
 def plotAzumithalError(cself, cam_id, fno=1, clearFigure=True, stats=None, noShow=False, title=""):
     if stats is None:
         stats = getAllPointStatistics(cself, cam_id)
-    angleError = np.array([ [ np.degrees(s.azumithalAngle), math.sqrt(s.squaredError)] for s in stats ])
+    angleError = np.array([ [ np.degrees(s.azumithalAngle), math.sqrt(s.squaredError)] for s in stats ], dtype=float)
+    if angleError.size == 0:
+        angleError = np.zeros((0, 2))
+    elif angleError.ndim == 1:
+        angleError = angleError.reshape(1, -1)
     # sort by azimuthal angle
     sae = angleError[ angleError[:,0].argsort() ]
     # Now plot
